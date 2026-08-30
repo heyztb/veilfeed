@@ -1,0 +1,18 @@
+{
+  "nodeModulesDir": "auto",
+  "imports": {
+    "@std/assert": "jsr:@std/assert@^1.0.14"
+  },
+  "tasks": {
+    "dev": "vite",
+    "build": "vite build && deno run --allow-read --allow-write scripts/check-bundle-size.mjs",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "deno test --no-check --allow-read src",
+    "tauri": "tauri",
+    "release:version": "deno run --allow-read --allow-write scripts/release-version.ts set",
+    "release:verify": "deno run --allow-read scripts/release-version.ts verify"
+  },
+  "fmt": {
+    "exclude": ["src-tauri/target", "src-tauri/gen", "dist", "node_modules"]
+  }
+}

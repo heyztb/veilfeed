@@ -1,0 +1,56 @@
+[package]
+name = "veilfeed"
+version = "0.1.0"
+description = "A private, proxy-aware desktop feed reader"
+authors = ["Veilfeed contributors"]
+edition = "2024"
+
+[lib]
+name = "veilfeed_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+adblock = { version = "0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
+ammonia = "4"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dom_smoothie = "0.18"
+dom_query = "0.28"
+feed-rs = "2"
+futures = "0.3"
+hex = "0.4"
+keyring = { version = "3", features = ["apple-native"] }
+percent-encoding = "2"
+quick-xml = { version = "0.38", features = ["serialize"] }
+roxmltree = "0.20"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "gzip", "brotli", "deflate", "charset", "stream"] }
+scraper = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono", "uuid"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-notification = "2"
+tauri-plugin-opener = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "net"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+incremental = true # Compile your binary in smaller steps.
+
+[profile.release]
+codegen-units = 1 # Allows LLVM to perform better optimization.
+lto = true # Enables link-time-optimizations.
+opt-level = "s" # Prioritizes small binary size. Use `3` if you prefer speed.
+panic = "abort" # Higher performance by disabling panic handlers.
+strip = true # Ensures debug symbols are removed.
