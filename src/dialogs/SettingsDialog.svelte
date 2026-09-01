@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { api } from "../lib/api";
   import { getExternalBrowser, setExternalBrowser, type ExternalBrowser } from "../lib/externalBrowser";
   import { disableNotifications, enableNotifications, notificationsEnabled } from "../lib/notifications";
@@ -9,7 +9,7 @@
   import { automaticUpdateChecksEnabled, lastUpdateCheckAt, setAutomaticUpdateChecksEnabled } from "../lib/releaseUpdates";
   import type { OpmlPreview, ProxyProfile, ReleaseCheck } from "../lib/types";
 
-  let { proxies, releaseCheck, onclose, onchanged, onimported, oncheckupdates, onopenrelease, onupdatepreferencechanged }: { proxies: ProxyProfile[]; releaseCheck?: ReleaseCheck; onclose: () => void; onchanged: () => void; onimported: () => void | Promise<void>; oncheckupdates: () => Promise<ReleaseCheck>; onopenrelease: (url: string) => void; onupdatepreferencechanged: () => void } = $props();
+  let { proxies, defaultProxyProfileId, releaseCheck, onclose, onchanged, onimported, oncheckupdates, onopenrelease, onupdatepreferencechanged }: { proxies: ProxyProfile[]; defaultProxyProfileId: string; releaseCheck?: ReleaseCheck; onclose: () => void; onchanged: () => void | Promise<void>; onimported: () => void | Promise<void>; oncheckupdates: () => Promise<ReleaseCheck>; onopenrelease: (url: string) => void; onupdatepreferencechanged: () => void } = $props();
   const sections = ["connections", "external-links", "notifications", "updates", "appearance", "opml"] as const;
   let section = $state<(typeof sections)[number]>("connections");
   let theme = $state<Theme>(getTheme());
@@ -20,8 +20,8 @@
   let notificationEnabled = $state(notificationsEnabled()); let notificationBusy = $state(false); let notificationError = $state("");
   let updateChecksEnabled = $state(automaticUpdateChecksEnabled()); let updateBusy = $state(false); let updateError = $state(""); let checkedRelease = $state<ReleaseCheck>(); let checkedAt = $state(lastUpdateCheckAt()); let currentVersion = $state("");
   let displayedRelease = $derived(checkedRelease ?? releaseCheck);
-  let error = $state(""); let busy = $state(false);
-  let opmlPreview = $state<OpmlPreview>(); let opmlProxyId = $state("direct"); let opmlBusy = $state(false); let opmlMessage = $state(""); let opmlError = $state("");
+  let error = $state(""); let busy = $state(false); let defaultProxyId = $state(untrack(() => defaultProxyProfileId)); let defaultProxyBusy = $state(false); let defaultProxyError = $state("");
+  let opmlPreview = $state<OpmlPreview>(); let opmlProxyId = $state(untrack(() => defaultProxyProfileId)); let opmlBusy = $state(false); let opmlMessage = $state(""); let opmlError = $state("");
 
   function edit(p?: ProxyProfile) { editing = p; name = p?.name ?? ""; kind = p?.kind ?? "socks5"; endpoint = p?.endpoint ?? ""; username = p?.username ?? ""; password = ""; remoteDns = p?.remoteDns ?? true; error = ""; }
   function selectTheme(value: Theme) { theme = value; applyTheme(value); }
@@ -62,6 +62,13 @@
     try { await api.saveProxy({ id: editing?.id, name, kind, endpoint: kind === "direct" ? null : endpoint, username: username || null, password: password || null, remoteDns }); await onchanged(); edit(); }
     catch (e) { error = (e as { message: string }).message; }
     finally { busy = false; }
+  }
+  async function selectDefaultProxy(id: string) {
+    const previous = defaultProxyId;
+    defaultProxyId = id; defaultProxyBusy = true; defaultProxyError = "";
+    try { await api.setDefaultProxyProfile(id); await onchanged(); }
+    catch (e) { defaultProxyId = previous; defaultProxyError = (e as { message: string }).message; }
+    finally { defaultProxyBusy = false; }
   }
   async function pickOpml(event: Event) {
     const file = (event.currentTarget as HTMLInputElement).files?.[0];
@@ -111,6 +118,9 @@
         {#if section === "connections"}
           <div role="tabpanel" id="settings-panel-connections" aria-labelledby="settings-tab-connections" tabindex="0">
             <div class="heading"><div><h3>Connection profiles</h3><p>Feeds fail closed when their assigned connection is unavailable.</p></div><button class="primary" onclick={() => edit(undefined)}>New profile</button></div>
+            <label>Default connection for new feeds<select value={defaultProxyId} onchange={(event) => selectDefaultProxy(event.currentTarget.value)} disabled={defaultProxyBusy} aria-busy={defaultProxyBusy}>{#each proxies as proxy}<option value={proxy.id}>{proxy.name}</option>{/each}</select></label>
+            <p class="setting-note">Preselected for new subscriptions and imports. Existing feeds keep their assigned connection.</p>
+            {#if defaultProxyError}<p class="error" role="alert">{defaultProxyError}</p>{/if}
             <div class="profiles">{#each proxies as proxy}<button onclick={() => edit(proxy)}><b>{proxy.name}</b><span>{proxy.kind === "direct" ? "No proxy" : proxy.endpoint}</span><em>{proxy.remoteDns ? "Remote DNS" : ""}</em></button>{/each}</div>
             {#if editing !== undefined || name !== ""}
               <form onsubmit={(event) => { event.preventDefault(); save(); }}>

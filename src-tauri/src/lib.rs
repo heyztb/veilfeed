@@ -98,6 +98,8 @@ pub fn run() {
             commands::move_feed,
             commands::delete_feed,
             commands::list_proxies,
+            commands::get_default_proxy_profile,
+            commands::set_default_proxy_profile,
             commands::save_proxy,
             commands::test_proxy,
             commands::discover_feed,

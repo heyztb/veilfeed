@@ -64,6 +64,9 @@ export const api = {
     call<void>("move_feed", { id, folderId }),
   deleteFeed: (id: string) => call<void>("delete_feed", { id }),
   proxies: () => call<ProxyProfile[]>("list_proxies"),
+  defaultProxyProfile: () => call<string>("get_default_proxy_profile"),
+  setDefaultProxyProfile: (id: string) =>
+    call<void>("set_default_proxy_profile", { id }),
   saveProxy: (input: Record<string, unknown>) =>
     call<string>("save_proxy", { input }),
   testProxy: (id: string) => call<void>("test_proxy", { id }),

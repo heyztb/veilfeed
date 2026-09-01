@@ -1,9 +1,10 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { api } from "../lib/api";
   import { modal } from "../lib/modal";
   import type { FolderSummary, ProxyProfile } from "../lib/types";
-  let { folders, proxies, onclose, onadded }: { folders: FolderSummary[]; proxies: ProxyProfile[]; onclose: () => void; onadded: () => void } = $props();
-  let url = $state(""); let folderId = $state(""); let newFolder = $state(""); let proxyId = $state("direct"); let busy = $state(false); let error = $state(""); let candidates = $state<string[]>([]);
+  let { folders, proxies, defaultProxyProfileId, onclose, onadded }: { folders: FolderSummary[]; proxies: ProxyProfile[]; defaultProxyProfileId: string; onclose: () => void; onadded: () => void } = $props();
+  let url = $state(""); let folderId = $state(""); let newFolder = $state(""); let proxyId = $state(untrack(() => defaultProxyProfileId)); let busy = $state(false); let error = $state(""); let candidates = $state<string[]>([]);
   async function discover() { busy=true;error="";try{candidates=await api.discover(url,proxyId);if(candidates.length===1)url=candidates[0]}catch(e){error=(e as {message:string}).message}finally{busy=false} }
   async function add() { busy=true;error="";try{const target=folderId||undefined;const result=await api.subscribe({url,folderId:newFolder.trim()?undefined:target,proxyProfileId:proxyId});if(newFolder.trim())await api.createFolder(newFolder.trim(),undefined,result.feedId);onadded()}catch(e){error=(e as {message:string}).message}finally{busy=false} }
 </script>

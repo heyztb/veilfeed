@@ -62,13 +62,38 @@ impl Database {
             .fetch_all(&self.pool).await?)
     }
 
+    pub async fn default_proxy_profile_id(&self) -> AppResult<String> {
+        Ok(
+            sqlx::query_scalar("SELECT value FROM settings WHERE key='default_proxy_profile_id'")
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn set_default_proxy_profile_id(&self, id: &str) -> AppResult<()> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM proxy_profiles WHERE id=? AND deleted_at IS NULL)",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        if !exists {
+            return Err(AppError::InvalidInput(
+                "default connection profile does not exist".into(),
+            ));
+        }
+        sqlx::query("UPDATE settings SET value=? WHERE key='default_proxy_profile_id'")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn proxy(&self, id: Option<&str>) -> AppResult<Option<ProxyProfile>> {
         let id = if let Some(id) = id {
             id.to_owned()
         } else {
-            sqlx::query_scalar("SELECT value FROM settings WHERE key='default_proxy_profile_id'")
-                .fetch_one(&self.pool)
-                .await?
+            self.default_proxy_profile_id().await?
         };
         Ok(sqlx::query_as("SELECT id,name,kind,endpoint,username,remote_dns FROM proxy_profiles WHERE id=? AND deleted_at IS NULL")
             .bind(id).fetch_optional(&self.pool).await?)
@@ -670,11 +695,12 @@ mod tests {
             .unwrap();
         assert_eq!(db.proxy(None).await.unwrap().unwrap().id, "direct");
 
-        sqlx::query("UPDATE settings SET value='tor' WHERE key='default_proxy_profile_id'")
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        db.set_default_proxy_profile_id("tor").await.unwrap();
+        assert_eq!(db.default_proxy_profile_id().await.unwrap(), "tor");
         assert_eq!(db.proxy(None).await.unwrap().unwrap().id, "tor");
+
+        assert!(db.set_default_proxy_profile_id("missing").await.is_err());
+        assert_eq!(db.default_proxy_profile_id().await.unwrap(), "tor");
     }
 
     #[tokio::test]

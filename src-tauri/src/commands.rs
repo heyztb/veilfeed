@@ -214,6 +214,27 @@ pub async fn list_proxies(state: State<'_, AppState>) -> CommandResult<Vec<Proxy
 }
 
 #[tauri::command]
+pub async fn get_default_proxy_profile(state: State<'_, AppState>) -> CommandResult<String> {
+    state
+        .db
+        .default_proxy_profile_id()
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn set_default_proxy_profile(
+    state: State<'_, AppState>,
+    id: String,
+) -> CommandResult<()> {
+    state
+        .db
+        .set_default_proxy_profile_id(&id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn save_proxy(
     state: State<'_, AppState>,
     input: SaveProxyInput,
