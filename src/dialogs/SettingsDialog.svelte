@@ -7,14 +7,16 @@
   import { applyTheme, getTheme, type Theme } from "../lib/theme";
   import { modal } from "../lib/modal";
   import { automaticUpdateChecksEnabled, lastUpdateCheckAt, setAutomaticUpdateChecksEnabled } from "../lib/releaseUpdates";
+  import { setVimNavigationEnabled, vimNavigationEnabled } from "../lib/vimNavigation";
   import type { OpmlPreview, ProxyProfile, ReleaseCheck } from "../lib/types";
 
-  let { proxies, defaultProxyProfileId, releaseCheck, onclose, onchanged, onimported, oncheckupdates, onopenrelease, onupdatepreferencechanged }: { proxies: ProxyProfile[]; defaultProxyProfileId: string; releaseCheck?: ReleaseCheck; onclose: () => void; onchanged: () => void | Promise<void>; onimported: () => void | Promise<void>; oncheckupdates: () => Promise<ReleaseCheck>; onopenrelease: (url: string) => void; onupdatepreferencechanged: () => void } = $props();
-  const sections = ["connections", "external-links", "notifications", "updates", "appearance", "opml"] as const;
+  let { proxies, defaultProxyProfileId, releaseCheck, onclose, onchanged, onimported, oncheckupdates, onopenrelease, onupdatepreferencechanged, onvimnavigationchanged }: { proxies: ProxyProfile[]; defaultProxyProfileId: string; releaseCheck?: ReleaseCheck; onclose: () => void; onchanged: () => void | Promise<void>; onimported: () => void | Promise<void>; oncheckupdates: () => Promise<ReleaseCheck>; onopenrelease: (url: string) => void; onupdatepreferencechanged: () => void; onvimnavigationchanged: (enabled: boolean) => void } = $props();
+  const sections = ["connections", "external-links", "notifications", "updates", "appearance", "keyboard", "opml"] as const;
   let section = $state<(typeof sections)[number]>("connections");
   let theme = $state<Theme>(getTheme());
   let readerFont = $state<ReaderFont>(getReaderFont());
   let externalBrowser = $state<ExternalBrowser>(getExternalBrowser());
+  let vimNavigation = $state(vimNavigationEnabled());
   let editing = $state<ProxyProfile | undefined>();
   let name = $state(""); let kind = $state("socks5"); let endpoint = $state(""); let username = $state(""); let password = $state(""); let remoteDns = $state(true);
   let notificationEnabled = $state(notificationsEnabled()); let notificationBusy = $state(false); let notificationError = $state("");
@@ -27,6 +29,7 @@
   function selectTheme(value: Theme) { theme = value; applyTheme(value); }
   function selectReaderFont(value: ReaderFont) { readerFont = value; applyReaderFont(value); }
   function selectExternalBrowser(value: ExternalBrowser) { externalBrowser = value; setExternalBrowser(value); }
+  function toggleVimNavigation() { vimNavigation = !vimNavigation; setVimNavigationEnabled(vimNavigation); onvimnavigationchanged(vimNavigation); }
   function sectionKeydown(event: KeyboardEvent) {
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
@@ -164,6 +167,12 @@
             <div class="theme-options" role="radiogroup" aria-label="Theme">{#each [["system", "System", "Follows macOS"], ["light", "Light", "Always use the light theme"], ["dark", "Dark", "Always use the dark theme"]] as option}<label class="option-card" class:active={theme === option[0]}><input type="radio" name="theme" value={option[0]} checked={theme === option[0]} onchange={() => selectTheme(option[0] as Theme)}/><span class="theme-swatch {option[0]}" aria-hidden="true"></span><span><b>{option[1]}</b><small>{option[2]}</small></span><i aria-hidden="true">{theme === option[0] ? "✓" : ""}</i></label>{/each}</div>
             <h4>Reading font</h4>
             <div class="theme-options font-options" role="radiogroup" aria-label="Reading font">{#each [["serif", "Serif", "Classic, book-like typography"], ["sans-serif", "Sans-serif", "Clean, modern typography"], ["opendyslexic", "OpenDyslexic", "Designed for readers with dyslexia"]] as option}<label class="option-card" class:active={readerFont === option[0]}><input type="radio" name="reader-font" value={option[0]} checked={readerFont === option[0]} onchange={() => selectReaderFont(option[0] as ReaderFont)}/><span class="font-sample {option[0]}" aria-hidden="true">Aa</span><span><b>{option[1]}</b><small>{option[2]}</small></span><i aria-hidden="true">{readerFont === option[0] ? "✓" : ""}</i></label>{/each}</div>
+          </div>
+        {:else if section === "keyboard"}
+          <div role="tabpanel" id="settings-panel-keyboard" aria-labelledby="settings-tab-keyboard" tabindex="0">
+            <div class="heading"><div><h3>Keyboard navigation</h3><p>Choose optional shortcuts for moving around Veilfeed.</p></div></div>
+            <div class="setting-card"><div><b>Vim-style navigation</b><span>Use h/l to switch panes and j/k to navigate subscriptions and articles or scroll the reader.</span></div><button class:enabled={vimNavigation} class="toggle" role="switch" aria-checked={vimNavigation} aria-label="Enable Vim-style navigation" onclick={toggleVimNavigation}><span></span></button></div>
+            <p class="setting-note">Disabled by default. Changes apply immediately.</p>
           </div>
         {:else}
           <div role="tabpanel" id="settings-panel-opml" aria-labelledby="settings-tab-opml" tabindex="0">

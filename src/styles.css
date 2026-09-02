@@ -100,6 +100,16 @@ a:focus-visible,
   padding-top: 28px;
   background: var(--surface);
 }
+.shell [data-pane] {
+  position: relative;
+  transition: box-shadow .12s ease;
+}
+.shell[data-active-pane="subscriptions"] [data-pane="subscriptions"],
+.shell[data-active-pane="articles"] [data-pane="articles"],
+.shell[data-active-pane="reader"] [data-pane="reader"] {
+  z-index: 1;
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
 .pane-splitter {
   position: relative;
   z-index: 5;

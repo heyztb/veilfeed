@@ -3,7 +3,7 @@
   import Icon from "./Icon.svelte";
   import SourceIcon from "./SourceIcon.svelte";
   import type { ArticleDetail, FeedSummary } from "../lib/types";
-  let { article, feed, loading, onstar, onfull }: { article?: ArticleDetail; feed?: FeedSummary; loading: boolean; onstar: () => void; onfull: () => void } = $props();
+  let { article, feed, vimNavigationEnabled, loading, onstar, onfull }: { article?: ArticleDetail; feed?: FeedSummary; vimNavigationEnabled: boolean; loading: boolean; onstar: () => void; onfull: () => void } = $props();
   let fontScale = $state(1);
   let pendingExternalUrl = $state<string>();
   let hoveredUrl = $state<string>();
@@ -39,6 +39,11 @@
   function cancelExternal() {
     pendingExternalUrl = undefined;
   }
+  let reader: HTMLElement;
+  export function focusPane() { reader.focus(); }
+  export function scrollVim(key: "j" | "k") {
+    reader.scrollBy({ top: key === "j" ? 64 : -64, behavior: "auto" });
+  }
   async function retrieveFull() {
     if (retrievingFull) return;
     retrievingFull = true;
@@ -64,7 +69,7 @@
   }
 </script>
 
-<main class="reader" aria-label="Article reader" aria-busy={loading} inert={!!pendingExternalUrl}>
+<main class="reader" bind:this={reader} data-pane="reader" aria-label="Article reader" aria-keyshortcuts={vimNavigationEnabled ? "h l j k" : undefined} title={vimNavigationEnabled ? "Reader: h/l switch panes; j/k scroll" : undefined} tabindex="-1" aria-busy={loading} inert={!!pendingExternalUrl}>
   {#if loading}<div class="placeholder" role="status">Loading article…</div>
   {:else if !article}<div class="placeholder"><div class="logo"><Icon name="feed" size={25}/></div><strong>Select an article</strong><span>Choose a story from the list to begin reading.</span></div>
   {:else}

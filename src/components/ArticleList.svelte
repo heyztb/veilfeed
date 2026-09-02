@@ -1,10 +1,11 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
   import SourceIcon from "./SourceIcon.svelte";
+  import { adjacentIndex } from "../lib/keyboardNavigation";
   import { windowRange, ARTICLE_ROW_HEIGHT } from "../lib/windowing";
   import type { ArticleSummary, FeedSummary } from "../lib/types";
-  let { items, feeds, selectedId, search, loading, hasMore, onselect, onsearch, onloadmore, ontoggleStar }: {
-    items: ArticleSummary[]; feeds: FeedSummary[]; selectedId?: string; search: string; loading: boolean; hasMore: boolean;
+  let { items, feeds, selectedId, search, vimNavigationEnabled, loading, hasMore, onselect, onsearch, onloadmore, ontoggleStar }: {
+    items: ArticleSummary[]; feeds: FeedSummary[]; selectedId?: string; search: string; vimNavigationEnabled: boolean; loading: boolean; hasMore: boolean;
     onselect: (id: string) => void; onsearch: (value: string) => void; onloadmore: () => void; ontoggleStar: (article: ArticleSummary) => void;
   } = $props();
   let viewport: HTMLDivElement; let scrollTop = $state(0); let viewportHeight = $state(700);
@@ -12,10 +13,35 @@
   let feedsById = $derived(new Map(feeds.map((feed) => [feed.id, feed])));
   const date = (value?: string) => value ? new Intl.DateTimeFormat(undefined,{month:"short",day:"numeric"}).format(new Date(value)) : "";
   function scroll() { scrollTop = viewport.scrollTop; viewportHeight = viewport.clientHeight; if (hasMore && viewport.scrollTop + viewport.clientHeight > viewport.scrollHeight - 220) onloadmore(); }
+  function focusIndex(index: number) {
+    const top = index * ARTICLE_ROW_HEIGHT;
+    const bottom = top + ARTICLE_ROW_HEIGHT;
+    if (top < viewport.scrollTop) viewport.scrollTop = top;
+    else if (bottom > viewport.scrollTop + viewport.clientHeight) viewport.scrollTop = bottom - viewport.clientHeight;
+    scrollTop = viewport.scrollTop;
+    viewportHeight = viewport.clientHeight;
+    requestAnimationFrame(() => viewport.querySelector<HTMLElement>(`[data-article-id="${CSS.escape(items[index].id)}"]`)?.focus());
+  }
+  export function focusCurrent() {
+    const index = Math.max(0, items.findIndex((article) => article.id === selectedId));
+    if (!items[index]) {
+      document.querySelector<HTMLElement>('[data-pane="articles"]')?.focus();
+      return;
+    }
+    focusIndex(index);
+  }
+  export function navigate(key: "j" | "k") {
+    const focusedId = (document.activeElement as HTMLElement | null)?.dataset.articleId;
+    const current = items.findIndex((article) => article.id === (focusedId ?? selectedId));
+    const index = adjacentIndex(items.length, current, key);
+    if (index === undefined) return;
+    onselect(items[index].id);
+    focusIndex(index);
+  }
   function rowKeydown(event: KeyboardEvent, id: string) {
-    if (!["ArrowDown", "ArrowUp", "j", "k"].includes(event.key)) return;
+    if (!["ArrowDown", "ArrowUp"].includes(event.key)) return;
     event.preventDefault();
-    const direction = event.key === "ArrowDown" || event.key === "j" ? 1 : -1;
+    const direction = event.key === "ArrowDown" ? 1 : -1;
     const index = items.findIndex((article) => article.id === id);
     const next = items[Math.max(0, Math.min(items.length - 1, index + direction))];
     if (!next) return;
@@ -24,7 +50,7 @@
   }
 </script>
 
-<section class="list-pane" aria-label="Articles">
+<section class="list-pane" data-pane="articles" aria-label="Articles" aria-keyshortcuts={vimNavigationEnabled ? "h l j k" : undefined} title={vimNavigationEnabled ? "Articles: h/l switch panes; j/k navigate" : undefined} tabindex="-1">
   <header><label><Icon name="search"/><input value={search} oninput={(event) => onsearch(event.currentTarget.value)} placeholder="Search articles" aria-label="Search articles"/></label></header>
   <div class="viewport" bind:this={viewport} onscroll={scroll} role="list" aria-label="Article results" aria-busy={loading}>
     {#if loading && items.length === 0}<div class="empty" role="status">Loading articles…</div>
@@ -33,7 +59,7 @@
       <div aria-hidden="true" style={`height:${range.before}px`}></div>
       {#each items.slice(range.start, range.end) as article, visibleIndex (article.id)}
         <div class="article-row" class:selected={selectedId === article.id} class:unread={article.isUnread} style={`height:${ARTICLE_ROW_HEIGHT}px`} role="listitem" aria-posinset={range.start + visibleIndex + 1} aria-setsize={items.length}>
-          <button class="article-open" data-article-id={article.id} aria-current={selectedId === article.id ? "true" : undefined} onclick={() => onselect(article.id)} onkeydown={(event) => rowKeydown(event, article.id)}>
+          <button class="article-open" data-vim-item data-article-id={article.id} aria-current={selectedId === article.id ? "true" : undefined} onclick={() => onselect(article.id)} onkeydown={(event) => rowKeydown(event, article.id)}>
             <div class="meta"><span class="source">{#if feedsById.get(article.feedId)}<SourceIcon feed={feedsById.get(article.feedId)!} size={14}/>{/if}<span>{article.feedTitle}</span></span><time>{date(article.publishedAt ?? article.receivedAt)}</time></div>
             <div class="title">{article.title}</div>
             <div class="excerpt">{article.excerpt}</div>

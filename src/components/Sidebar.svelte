@@ -2,10 +2,11 @@
   import Icon from "./Icon.svelte";
   import SourceIcon from "./SourceIcon.svelte";
   import ContextMenu from "./ContextMenu.svelte";
+  import { adjacentIndex } from "../lib/keyboardNavigation";
   import type { Scope, SidebarData } from "../lib/types";
-  let { data, selection, onselect, onadd, oncreatefolder, onrenamefolder, ondeletefolder, onrefresh, onsettings, onmove, onmanage, onmarkread, refreshing }: {
+  let { data, selection, vimNavigationEnabled, onselect, onadd, oncreatefolder, onrenamefolder, ondeletefolder, onrefresh, onsettings, onmove, onmanage, onmarkread, refreshing }: {
     data: SidebarData; selection: { scope: Scope; id?: string }; onselect: (scope: Scope, id?: string) => void;
-    onadd: () => void; oncreatefolder: (feedId?: string) => void; onrenamefolder: (folderId: string) => void; ondeletefolder: (folderId: string) => void; onrefresh: (feedId?: string) => void; onsettings: () => void; onmove: (feedId:string,folderId?:string)=>void; onmanage:(feedId:string)=>void; onmarkread:(scope:Scope,id?:string)=>void; refreshing: boolean;
+    vimNavigationEnabled: boolean; onadd: () => void; oncreatefolder: (feedId?: string) => void; onrenamefolder: (folderId: string) => void; ondeletefolder: (folderId: string) => void; onrefresh: (feedId?: string) => void; onsettings: () => void; onmove: (feedId:string,folderId?:string)=>void; onmanage:(feedId:string)=>void; onmarkread:(scope:Scope,id?:string)=>void; refreshing: boolean;
   } = $props();
   const active = (scope: Scope, id?: string) => selection.scope === scope && selection.id === id;
   type MenuTarget = { x: number; y: number; trigger: HTMLElement; scope: Scope; id?: string; label: string; canMarkRead: boolean; manageable?: boolean };
@@ -13,8 +14,29 @@
   let draggingFeedId = $state("");
   let dropFolderId = $state<string | undefined>();
   let collapsed = $state<Record<string, boolean>>({});
+  let sidebarElement: HTMLElement;
   let unfiledFeeds = $derived(data.feeds.filter((feed) => !feed.folderId));
   let unfiledUnreadCount = $derived(unfiledFeeds.reduce((total, feed) => total + feed.unreadCount, 0));
+  function subscriptionButtons() {
+    return Array.from(sidebarElement.querySelectorAll<HTMLButtonElement>("[data-vim-subscription]"));
+  }
+  function selectedButton(buttons: HTMLButtonElement[]) {
+    return buttons.find((button) => button.dataset.scope === selection.scope && button.dataset.scopeId === selection.id);
+  }
+  export function focusCurrent() {
+    const buttons = subscriptionButtons();
+    (selectedButton(buttons) ?? buttons[0])?.focus();
+  }
+  export function navigate(key: "j" | "k") {
+    const buttons = subscriptionButtons();
+    const focused = document.activeElement instanceof HTMLButtonElement ? document.activeElement : undefined;
+    const current = focused && buttons.includes(focused) ? buttons.indexOf(focused) : buttons.indexOf(selectedButton(buttons)!);
+    const index = adjacentIndex(buttons.length, current, key);
+    if (index === undefined) return;
+    const button = buttons[index];
+    button.focus();
+    onselect(button.dataset.scope as Scope, button.dataset.scopeId);
+  }
   let menuItems = $derived.by(() => {
     const target = menu;
     if (!target) return [];
@@ -71,11 +93,11 @@
   }
 </script>
 
-<aside class="sidebar" aria-label="Subscriptions">
+<aside class="sidebar" bind:this={sidebarElement} data-pane="subscriptions" aria-label="Subscriptions" aria-keyshortcuts={vimNavigationEnabled ? "h l j k" : undefined} title={vimNavigationEnabled ? "Subscriptions: h/l switch panes; j/k navigate" : undefined}>
   <div class="brand"><span class="mark"><Icon name="feed" size={18}/></span><strong>Veilfeed</strong></div>
   <nav aria-label="Article scopes">
-    <button class:active={active("all")} aria-current={active("all") ? "page" : undefined} aria-label={`All articles${countLabel(data.unreadCount)}`} onclick={() => onselect("all")} oncontextmenu={(event) => openMenu(event,{scope:"all",label:"All articles",canMarkRead:data.unreadCount>0})} onkeydown={(event) => openMenu(event,{scope:"all",label:"All articles",canMarkRead:data.unreadCount>0})}><Icon name="inbox"/><span>All articles</span><b aria-hidden="true">{data.unreadCount}</b></button>
-    <button class:active={active("starred")} aria-current={active("starred") ? "page" : undefined} aria-label={`Starred${data.starredCount ? `, ${data.starredCount} articles` : ""}`} onclick={() => onselect("starred")} oncontextmenu={(event) => openMenu(event,{scope:"starred",label:"Starred",canMarkRead:true})} onkeydown={(event) => openMenu(event,{scope:"starred",label:"Starred",canMarkRead:true})}><Icon name="star"/><span>Starred</span><b aria-hidden="true">{data.starredCount}</b></button>
+    <button data-vim-item data-vim-subscription data-scope="all" class:active={active("all")} aria-current={active("all") ? "page" : undefined} aria-label={`All articles${countLabel(data.unreadCount)}`} onclick={() => onselect("all")} oncontextmenu={(event) => openMenu(event,{scope:"all",label:"All articles",canMarkRead:data.unreadCount>0})} onkeydown={(event) => openMenu(event,{scope:"all",label:"All articles",canMarkRead:data.unreadCount>0})}><Icon name="inbox"/><span>All articles</span><b aria-hidden="true">{data.unreadCount}</b></button>
+    <button data-vim-item data-vim-subscription data-scope="starred" class:active={active("starred")} aria-current={active("starred") ? "page" : undefined} aria-label={`Starred${data.starredCount ? `, ${data.starredCount} articles` : ""}`} onclick={() => onselect("starred")} oncontextmenu={(event) => openMenu(event,{scope:"starred",label:"Starred",canMarkRead:true})} onkeydown={(event) => openMenu(event,{scope:"starred",label:"Starred",canMarkRead:true})}><Icon name="star"/><span>Starred</span><b aria-hidden="true">{data.starredCount}</b></button>
   </nav>
   <div role="group" aria-label="Subscription actions" class="section-title">
     <span>Subscriptions</span><div class="section-actions"><button title="Create folder" aria-label="Create folder" onclick={() => oncreatefolder()} ondragover={(event) => { if (draggingFeedId) event.preventDefault(); }} ondrop={(event) => { event.preventDefault(); event.stopPropagation(); const feedId = draggedFeed(event); endDrag(); if (feedId) oncreatefolder(feedId); }}><Icon name="folder-plus"/></button><button title="Add subscription" aria-label="Add subscription" onclick={onadd}><Icon name="plus"/></button></div>
@@ -87,7 +109,7 @@
       </div>
       {#if !collapsed[folder.id]}
         {#each data.feeds.filter((feed) => feed.folderId === folder.id) as feed}
-          <button class="feed nested" draggable="true" aria-current={active("feed",feed.id) ? "page" : undefined} aria-label={feedLabel(feed)} ondragstart={(event)=>startDrag(event,feed.id)} ondragend={endDrag} oncontextmenu={(event)=>openMenu(event,{scope:"feed",id:feed.id,label:feed.title,canMarkRead:feed.unreadCount>0,manageable:true})} onkeydown={(event)=>openMenu(event,{scope:"feed",id:feed.id,label:feed.title,canMarkRead:feed.unreadCount>0,manageable:true})} class:active={active("feed", feed.id)} class:error={!!feed.lastErrorCode} title={feed.lastErrorMessage ?? feed.feedUrl} onclick={() => onselect("feed", feed.id)}><SourceIcon {feed}/><span>{feed.title}</span><b aria-hidden="true">{feed.unreadCount || ""}</b></button>
+          <button class="feed nested" data-vim-item data-vim-subscription data-scope="feed" data-scope-id={feed.id} draggable="true" aria-current={active("feed",feed.id) ? "page" : undefined} aria-label={feedLabel(feed)} ondragstart={(event)=>startDrag(event,feed.id)} ondragend={endDrag} oncontextmenu={(event)=>openMenu(event,{scope:"feed",id:feed.id,label:feed.title,canMarkRead:feed.unreadCount>0,manageable:true})} onkeydown={(event)=>openMenu(event,{scope:"feed",id:feed.id,label:feed.title,canMarkRead:feed.unreadCount>0,manageable:true})} class:active={active("feed", feed.id)} class:error={!!feed.lastErrorCode} title={feed.lastErrorMessage ?? feed.feedUrl} onclick={() => onselect("feed", feed.id)}><SourceIcon {feed}/><span>{feed.title}</span><b aria-hidden="true">{feed.unreadCount || ""}</b></button>
         {/each}
       {/if}
     {/each}
@@ -97,7 +119,7 @@
       </div>
       {#if !collapsed.uncategorized}
         {#each unfiledFeeds as feed}
-          <button class="feed nested" draggable="true" aria-current={active("feed",feed.id) ? "page" : undefined} aria-label={feedLabel(feed)} ondragstart={(event)=>startDrag(event,feed.id)} ondragend={endDrag} oncontextmenu={(event)=>openMenu(event,{scope:"feed",id:feed.id,label:feed.title,canMarkRead:feed.unreadCount>0,manageable:true})} onkeydown={(event)=>openMenu(event,{scope:"feed",id:feed.id,label:feed.title,canMarkRead:feed.unreadCount>0,manageable:true})} class:active={active("feed", feed.id)} class:error={!!feed.lastErrorCode} title={feed.lastErrorMessage ?? feed.feedUrl} onclick={() => onselect("feed", feed.id)}><SourceIcon {feed}/><span>{feed.title}</span><b aria-hidden="true">{feed.unreadCount || ""}</b></button>
+          <button class="feed nested" data-vim-item data-vim-subscription data-scope="feed" data-scope-id={feed.id} draggable="true" aria-current={active("feed",feed.id) ? "page" : undefined} aria-label={feedLabel(feed)} ondragstart={(event)=>startDrag(event,feed.id)} ondragend={endDrag} oncontextmenu={(event)=>openMenu(event,{scope:"feed",id:feed.id,label:feed.title,canMarkRead:feed.unreadCount>0,manageable:true})} onkeydown={(event)=>openMenu(event,{scope:"feed",id:feed.id,label:feed.title,canMarkRead:feed.unreadCount>0,manageable:true})} class:active={active("feed", feed.id)} class:error={!!feed.lastErrorCode} title={feed.lastErrorMessage ?? feed.feedUrl} onclick={() => onselect("feed", feed.id)}><SourceIcon {feed}/><span>{feed.title}</span><b aria-hidden="true">{feed.unreadCount || ""}</b></button>
         {/each}
       {/if}
     {/if}
