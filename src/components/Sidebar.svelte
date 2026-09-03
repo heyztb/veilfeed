@@ -93,7 +93,8 @@
   }
 </script>
 
-<aside class="sidebar" bind:this={sidebarElement} data-pane="subscriptions" aria-label="Subscriptions" aria-keyshortcuts={vimNavigationEnabled ? "h l j k" : undefined} title={vimNavigationEnabled ? "Subscriptions: h/l switch panes; j/k navigate" : undefined}>
+<aside class="sidebar" bind:this={sidebarElement} data-pane="subscriptions" aria-label="Subscriptions" aria-keyshortcuts={vimNavigationEnabled ? "h l j k" : undefined} aria-describedby={vimNavigationEnabled ? "subscriptions-keyboard-hint" : undefined}>
+  {#if vimNavigationEnabled}<span id="subscriptions-keyboard-hint" class="sr-only">Use h and l to switch panes; j and k to navigate subscriptions.</span>{/if}
   <div class="brand"><span class="mark"><Icon name="feed" size={18}/></span><strong>Veilfeed</strong></div>
   <nav aria-label="Article scopes">
     <button data-vim-item data-vim-subscription data-scope="all" class:active={active("all")} aria-current={active("all") ? "page" : undefined} aria-label={`All articles${countLabel(data.unreadCount)}`} onclick={() => onselect("all")} oncontextmenu={(event) => openMenu(event,{scope:"all",label:"All articles",canMarkRead:data.unreadCount>0})} onkeydown={(event) => openMenu(event,{scope:"all",label:"All articles",canMarkRead:data.unreadCount>0})}><Icon name="inbox"/><span>All articles</span><b aria-hidden="true">{data.unreadCount}</b></button>

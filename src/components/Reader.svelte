@@ -69,7 +69,8 @@
   }
 </script>
 
-<main class="reader" bind:this={reader} data-pane="reader" aria-label="Article reader" aria-keyshortcuts={vimNavigationEnabled ? "h l j k" : undefined} title={vimNavigationEnabled ? "Reader: h/l switch panes; j/k scroll" : undefined} tabindex="-1" aria-busy={loading} inert={!!pendingExternalUrl}>
+<main class="reader" bind:this={reader} data-pane="reader" aria-label="Article reader" aria-keyshortcuts={vimNavigationEnabled ? "h l j k" : undefined} aria-describedby={vimNavigationEnabled ? "reader-keyboard-hint" : undefined} tabindex="-1" aria-busy={loading} inert={!!pendingExternalUrl}>
+  {#if vimNavigationEnabled}<span id="reader-keyboard-hint" class="sr-only">Use h and l to switch panes; j and k to scroll the article.</span>{/if}
   {#if loading}<div class="placeholder" role="status">Loading article…</div>
   {:else if !article}<div class="placeholder"><div class="logo"><Icon name="feed" size={25}/></div><strong>Select an article</strong><span>Choose a story from the list to begin reading.</span></div>
   {:else}

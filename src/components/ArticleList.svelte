@@ -50,7 +50,8 @@
   }
 </script>
 
-<section class="list-pane" data-pane="articles" aria-label="Articles" aria-keyshortcuts={vimNavigationEnabled ? "h l j k" : undefined} title={vimNavigationEnabled ? "Articles: h/l switch panes; j/k navigate" : undefined} tabindex="-1">
+<section class="list-pane" data-pane="articles" aria-label="Articles" aria-keyshortcuts={vimNavigationEnabled ? "h l j k" : undefined} aria-describedby={vimNavigationEnabled ? "articles-keyboard-hint" : undefined} tabindex="-1">
+  {#if vimNavigationEnabled}<span id="articles-keyboard-hint" class="sr-only">Use h and l to switch panes; j and k to navigate articles.</span>{/if}
   <header><label><Icon name="search"/><input value={search} oninput={(event) => onsearch(event.currentTarget.value)} placeholder="Search articles" aria-label="Search articles"/></label></header>
   <div class="viewport" bind:this={viewport} onscroll={scroll} role="list" aria-label="Article results" aria-busy={loading}>
     {#if loading && items.length === 0}<div class="empty" role="status">Loading articles…</div>
