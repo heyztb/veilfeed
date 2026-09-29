@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -28,7 +30,13 @@ impl Database {
     pub async fn open(path: &Path) -> AppResult<Self> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
+            #[cfg(unix)]
+            tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
         }
+        // SQLite gives the -wal and -shm files the main database file's mode,
+        // so the database must be private before the first connection opens.
+        #[cfg(unix)]
+        restrict_database_files(path)?;
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -40,25 +48,72 @@ impl Database {
             .await?;
         sqlx::migrate!().run(&pool).await?;
         let db = Self { pool };
+        db.backfill_article_media().await?;
         db.seed().await?;
         Ok(db)
+    }
+
+    /// Indexes media references for articles stored before `article_media`
+    /// existed. Migration 0005 sets the pending flag; clearing it in the same
+    /// transaction makes an interrupted backfill restart from scratch.
+    async fn backfill_article_media(&self) -> AppResult<()> {
+        let mut tx = self.pool.begin().await?;
+        let pending =
+            sqlx::query("DELETE FROM settings WHERE key='article_media_backfill_pending'")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        if pending == 0 {
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM article_media")
+            .execute(&mut *tx)
+            .await?;
+        let mut after = String::new();
+        loop {
+            let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT id,content_html,full_content_html FROM articles WHERE id>? ORDER BY id LIMIT 200",
+            )
+            .bind(&after)
+            .fetch_all(&mut *tx)
+            .await?;
+            let Some((last, _, _)) = rows.last() else {
+                break;
+            };
+            after = last.clone();
+            for (id, content, full_content) in &rows {
+                insert_article_media(&mut tx, id, content, full_content.as_deref()).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// True when a non-deleted article of `feed_id` references `token` in its
+    /// stored content or full content.
+    pub async fn article_media_authorized(&self, feed_id: &str, token: &str) -> AppResult<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM article_media m JOIN articles a ON a.id=m.article_id WHERE m.token=? AND a.feed_id=? AND a.deleted_at IS NULL)")
+            .bind(token)
+            .bind(feed_id)
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     async fn seed(&self) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query("INSERT OR IGNORE INTO proxy_profiles(id,name,kind,remote_dns,created_at,updated_at) VALUES('direct','Direct','direct',0,?,?)")
             .bind(&now).bind(&now).execute(&self.pool).await?;
-        sqlx::query("INSERT OR IGNORE INTO proxy_profiles(id,name,kind,endpoint,remote_dns,created_at,updated_at) VALUES('tor','Tor','socks5','socks5h://127.0.0.1:9050',1,?,?)")
+        sqlx::query("INSERT OR IGNORE INTO proxy_profiles(id,name,kind,endpoint,remote_dns,tor_isolation,created_at,updated_at) VALUES('tor','Tor','socks5','socks5h://127.0.0.1:9050',1,1,?,?)")
             .bind(&now).bind(&now).execute(&self.pool).await?;
-        sqlx::query("INSERT OR IGNORE INTO proxy_profiles(id,name,kind,endpoint,remote_dns,created_at,updated_at) VALUES('tor-browser','Tor Browser','socks5','socks5h://127.0.0.1:9150',1,?,?)")
+        sqlx::query("INSERT OR IGNORE INTO proxy_profiles(id,name,kind,endpoint,remote_dns,tor_isolation,created_at,updated_at) VALUES('tor-browser','Tor Browser','socks5','socks5h://127.0.0.1:9150',1,1,?,?)")
             .bind(&now).bind(&now).execute(&self.pool).await?;
-        sqlx::query("INSERT OR IGNORE INTO settings(key,value) VALUES('default_proxy_profile_id','direct'),('media_cache_limit_bytes','524288000'),('refresh_interval_minutes','60')")
+        sqlx::query("INSERT OR IGNORE INTO settings(key,value) VALUES('default_proxy_profile_id','direct'),('media_cache_limit_bytes','524288000'),('refresh_interval_minutes','60'),('automatic_blocklist_updates','false')")
             .execute(&self.pool).await?;
         Ok(())
     }
 
     pub async fn proxies(&self) -> AppResult<Vec<ProxyProfile>> {
-        Ok(sqlx::query_as("SELECT id,name,kind,endpoint,username,remote_dns FROM proxy_profiles WHERE deleted_at IS NULL ORDER BY CASE id WHEN 'direct' THEN 0 WHEN 'tor' THEN 1 WHEN 'tor-browser' THEN 2 ELSE 3 END,name")
+        Ok(sqlx::query_as("SELECT id,name,kind,endpoint,username,remote_dns,tor_isolation FROM proxy_profiles WHERE deleted_at IS NULL ORDER BY CASE id WHEN 'direct' THEN 0 WHEN 'tor' THEN 1 WHEN 'tor-browser' THEN 2 ELSE 3 END,name")
             .fetch_all(&self.pool).await?)
     }
 
@@ -95,8 +150,27 @@ impl Database {
         } else {
             self.default_proxy_profile_id().await?
         };
-        Ok(sqlx::query_as("SELECT id,name,kind,endpoint,username,remote_dns FROM proxy_profiles WHERE id=? AND deleted_at IS NULL")
-            .bind(id).fetch_optional(&self.pool).await?)
+        sqlx::query_as("SELECT id,name,kind,endpoint,username,remote_dns,tor_isolation FROM proxy_profiles WHERE id=? AND deleted_at IS NULL")
+            .bind(&id).fetch_optional(&self.pool).await?
+            .map(Some)
+            .ok_or_else(|| AppError::NotFound(format!("connection profile {id}")))
+    }
+
+    pub async fn automatic_blocklist_updates(&self) -> AppResult<bool> {
+        let value: String = sqlx::query_scalar(
+            "SELECT value FROM settings WHERE key='automatic_blocklist_updates'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(value == "true")
+    }
+
+    pub async fn set_automatic_blocklist_updates(&self, enabled: bool) -> AppResult<()> {
+        sqlx::query("UPDATE settings SET value=? WHERE key='automatic_blocklist_updates'")
+            .bind(if enabled { "true" } else { "false" })
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn sidebar(&self) -> AppResult<SidebarData> {
@@ -518,13 +592,16 @@ impl Database {
         html: &str,
         filter_revision: Option<&str>,
     ) -> AppResult<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE articles SET full_content_html=?,full_content_filter_revision=?,updated_at=? WHERE id=?")
             .bind(html)
             .bind(filter_revision)
             .bind(Utc::now().to_rfc3339())
             .bind(article_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        replace_article_media(&mut tx, article_id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -555,6 +632,7 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
         }
+        replace_article_media(&mut tx, article_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -667,6 +745,75 @@ async fn cleanup_empty_folder(
     Ok(())
 }
 
+/// Records the media tokens in an article's stored HTML so `media::load` can
+/// authorize them with an indexed lookup instead of scanning content.
+async fn insert_article_media(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    article_id: &str,
+    content_html: &str,
+    full_content_html: Option<&str>,
+) -> AppResult<()> {
+    let tokens = crate::media::article_media_tokens(content_html)
+        .chain(
+            full_content_html
+                .into_iter()
+                .flat_map(crate::media::article_media_tokens),
+        )
+        .collect::<HashSet<_>>();
+    for token in tokens {
+        sqlx::query("INSERT INTO article_media(article_id,token) VALUES(?,?)")
+            .bind(article_id)
+            .bind(token)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn replace_article_media(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    article_id: &str,
+) -> AppResult<()> {
+    sqlx::query("DELETE FROM article_media WHERE article_id=?")
+        .bind(article_id)
+        .execute(&mut **tx)
+        .await?;
+    let stored: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT content_html,full_content_html FROM articles WHERE id=?")
+            .bind(article_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if let Some((content_html, full_content_html)) = stored {
+        insert_article_media(tx, article_id, &content_html, full_content_html.as_deref()).await?;
+    }
+    Ok(())
+}
+
+/// Creates the database file private, or makes an existing one private, and
+/// tightens any WAL sidecars left by earlier versions.
+#[cfg(unix)]
+fn restrict_database_files(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        match std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
@@ -701,6 +848,26 @@ mod tests {
 
         assert!(db.set_default_proxy_profile_id("missing").await.is_err());
         assert_eq!(db.default_proxy_profile_id().await.unwrap(), "tor");
+        assert!(matches!(
+            db.proxy(Some("missing")).await,
+            Err(AppError::NotFound(_))
+        ));
+        sqlx::query("UPDATE settings SET value='missing' WHERE key='default_proxy_profile_id'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(matches!(db.proxy(None).await, Err(AppError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn automatic_blocklist_downloads_are_opt_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open(&directory.path().join("blocklists.db"))
+            .await
+            .unwrap();
+        assert!(!db.automatic_blocklist_updates().await.unwrap());
+        db.set_automatic_blocklist_updates(true).await.unwrap();
+        assert!(db.automatic_blocklist_updates().await.unwrap());
     }
 
     #[tokio::test]
@@ -717,13 +884,14 @@ mod tests {
                 .map(|profile| (
                     profile.id.as_str(),
                     profile.endpoint.as_deref(),
-                    profile.remote_dns
+                    profile.remote_dns,
+                    profile.tor_isolation
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("direct", None, false),
-                ("tor", Some("socks5h://127.0.0.1:9050"), true),
-                ("tor-browser", Some("socks5h://127.0.0.1:9150"), true),
+                ("direct", None, false, false),
+                ("tor", Some("socks5h://127.0.0.1:9050"), true, true),
+                ("tor-browser", Some("socks5h://127.0.0.1:9150"), true, true),
             ]
         );
     }
@@ -1107,6 +1275,81 @@ mod tests {
             0
         );
     }
+
+    #[tokio::test]
+    async fn article_media_references_follow_stored_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open(&directory.path().join("article-media.db"))
+            .await
+            .unwrap();
+        let token = |source: &str| {
+            crate::content::media_url(source, "feed")
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        let inline = token("https://example.com/inline.png");
+        let full = token("https://example.com/full.png");
+        let parsed = ParsedFeed {
+            title: "Feed".into(),
+            site_url: None,
+            icon_url: None,
+            description: None,
+            articles: vec![crate::network::ParsedArticle {
+                source_key: "guid:article".into(),
+                guid: None,
+                canonical_url: None,
+                title: "Article".into(),
+                author: None,
+                published_at: None,
+                summary_html: None,
+                content_html: format!("<img src=\"reader-media://localhost/{inline}\">"),
+                plain_text: String::new(),
+            }],
+            etag: None,
+            last_modified: None,
+            filter_revision: None,
+        };
+        db.insert_feed(
+            "https://example.com/feed.xml",
+            None,
+            None,
+            &parsed,
+            Some("feed"),
+        )
+        .await
+        .unwrap();
+        let article_id: String = sqlx::query_scalar("SELECT id FROM articles")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert!(db.article_media_authorized("feed", &inline).await.unwrap());
+        assert!(!db.article_media_authorized("other", &inline).await.unwrap());
+        assert!(!db.article_media_authorized("feed", &full).await.unwrap());
+
+        db.set_full_content(
+            &article_id,
+            &format!("<img src=\"reader-media://localhost/{full}\">"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(db.article_media_authorized("feed", &inline).await.unwrap());
+        assert!(db.article_media_authorized("feed", &full).await.unwrap());
+
+        db.persist_filtered_article(&article_id, Some(("<p>No images</p>", "revision")), None)
+            .await
+            .unwrap();
+        assert!(!db.article_media_authorized("feed", &inline).await.unwrap());
+        assert!(db.article_media_authorized("feed", &full).await.unwrap());
+
+        sqlx::query("UPDATE articles SET deleted_at=updated_at")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(!db.article_media_authorized("feed", &full).await.unwrap());
+    }
 }
 
 async fn insert_articles(
@@ -1117,10 +1360,14 @@ async fn insert_articles(
 ) -> AppResult<usize> {
     let mut count = 0;
     for article in &parsed.articles {
+        let id = Uuid::new_v4().to_string();
         let result = sqlx::query("INSERT OR IGNORE INTO articles(id,feed_id,source_key,guid,canonical_url,title,author,published_at,received_at,summary_html,content_html,plain_text,content_filter_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(Uuid::new_v4().to_string()).bind(feed_id).bind(&article.source_key).bind(&article.guid).bind(&article.canonical_url)
+            .bind(&id).bind(feed_id).bind(&article.source_key).bind(&article.guid).bind(&article.canonical_url)
             .bind(&article.title).bind(&article.author).bind(&article.published_at).bind(now).bind(&article.summary_html).bind(&article.content_html)
             .bind(&article.plain_text).bind(parsed.filter_revision.as_deref()).bind(now).bind(now).execute(&mut **tx).await?;
+        if result.rows_affected() > 0 {
+            insert_article_media(tx, &id, &article.content_html, None).await?;
+        }
         count += result.rows_affected() as usize;
     }
     Ok(count)

@@ -9,10 +9,10 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "deno test --no-check --allow-read src",
     "tauri": "tauri",
-    "release:version": "deno run --allow-read --allow-write scripts/release-version.ts set",
-    "release:verify": "deno run --allow-read scripts/release-version.ts verify"
+    "release:version": "deno run --allow-read --allow-write --allow-run=cargo scripts/release-version.ts set",
+    "release:verify": "deno run --allow-read --allow-run=cargo scripts/release-version.ts verify"
   },
   "fmt": {
-    "exclude": ["src-tauri/target", "src-tauri/gen", "dist", "node_modules"]
+    "exclude": ["target", "src-tauri/target", "src-tauri/gen", "dist", "node_modules"]
   }
 }

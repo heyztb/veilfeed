@@ -1,7 +1,10 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use adblock::{Engine, FilterSet, lists::ParseOptions, request::Request};
@@ -45,17 +48,18 @@ struct ActiveFilter {
 #[derive(Clone)]
 pub struct AdFilter {
     active: Arc<RwLock<ActiveFilter>>,
+    // Downloaded lists are only active while automatic updates are enabled.
+    use_cache: Arc<AtomicBool>,
     list_dir: PathBuf,
 }
 
 impl AdFilter {
-    pub fn load(data_dir: &Path) -> Self {
+    /// Builds the engine synchronously; call from a blocking context.
+    pub fn load(data_dir: &Path, use_cache: bool) -> Self {
         let list_dir = data_dir.join("filter-lists");
-        let cached = read_cache(&list_dir).filter(|cached| {
-            looks_like_filter_list(&cached.easylist, 1000)
-                && looks_like_filter_list(&cached.easyprivacy, 1000)
-        });
-        let (easylist, easyprivacy) = cached
+        let (easylist, easyprivacy) = use_cache
+            .then(|| read_valid_cache(&list_dir))
+            .flatten()
             .map(|cached| (cached.easylist, cached.easyprivacy))
             .unwrap_or_else(|| {
                 (
@@ -66,6 +70,7 @@ impl AdFilter {
         let active = build_active(easylist, easyprivacy);
         Self {
             active: Arc::new(RwLock::new(active)),
+            use_cache: Arc::new(AtomicBool::new(use_cache)),
             list_dir,
         }
     }
@@ -75,6 +80,7 @@ impl AdFilter {
         let directory = std::env::temp_dir().join("veilfeed-ad-filter-tests");
         Self {
             active: Arc::new(RwLock::new(build_active(rules.to_owned(), String::new()))),
+            use_cache: Arc::new(AtomicBool::new(false)),
             list_dir: directory,
         }
     }
@@ -87,26 +93,55 @@ impl AdFilter {
             .clone()
     }
 
+    fn automatic_updates(&self) -> bool {
+        self.use_cache.load(Ordering::SeqCst)
+    }
+
+    /// Enabling only permits `refresh` to activate downloaded lists; disabling
+    /// switches to the bundled lists immediately. The cache file is kept for
+    /// its conditional-request validators.
+    pub async fn set_automatic_updates(&self, enabled: bool) -> AppResult<()> {
+        self.use_cache.store(enabled, Ordering::SeqCst);
+        if enabled {
+            return Ok(());
+        }
+        let replacement = build_if_changed(
+            FALLBACK_EASYLIST.to_owned(),
+            FALLBACK_EASYPRIVACY.to_owned(),
+            self.revision(),
+        )
+        .await?;
+        if let Some(replacement) = replacement {
+            self.install(replacement, false);
+        }
+        Ok(())
+    }
+
     pub async fn refresh(
         &self,
         network: &Network,
         profile: Option<&ProxyProfile>,
     ) -> AppResult<()> {
-        let cached = read_cache(&self.list_dir).unwrap_or_else(|| CachedLists {
-            easylist: FALLBACK_EASYLIST.to_owned(),
-            easyprivacy: FALLBACK_EASYPRIVACY.to_owned(),
-            ..CachedLists::default()
-        });
-        if cached.checked_at.as_deref().is_some_and(|checked_at| {
-            chrono::DateTime::parse_from_rfc3339(checked_at)
-                .ok()
-                .is_some_and(|checked_at| {
-                    chrono::Utc::now().signed_duration_since(checked_at.with_timezone(&chrono::Utc))
-                        < chrono::Duration::hours(24)
-                })
-        }) {
+        if !self.automatic_updates() {
             return Ok(());
         }
+        let cached = match read_valid_cache(&self.list_dir) {
+            Some(cached) if checked_recently(&cached) => {
+                // A recent download may be inactive because updates were just enabled.
+                let replacement =
+                    build_if_changed(cached.easylist, cached.easyprivacy, self.revision()).await?;
+                if let Some(replacement) = replacement {
+                    self.install(replacement, true);
+                }
+                return Ok(());
+            }
+            Some(cached) => cached,
+            None => CachedLists {
+                easylist: FALLBACK_EASYLIST.to_owned(),
+                easyprivacy: FALLBACK_EASYPRIVACY.to_owned(),
+                ..CachedLists::default()
+            },
+        };
         let (easylist_result, easyprivacy_result) = tokio::try_join!(
             network.download_text(
                 EASYLIST_URL,
@@ -130,17 +165,31 @@ impl AdFilter {
             easyprivacy_last_modified: easyprivacy_result.last_modified,
             checked_at: Some(chrono::Utc::now().to_rfc3339()),
         };
-        if !looks_like_filter_list(&updated.easylist, 1000)
-            || !looks_like_filter_list(&updated.easyprivacy, 1000)
-        {
+        if !is_valid_cache(&updated) {
             return Err(AppError::InvalidInput(
                 "downloaded blocker lists failed validation".into(),
             ));
         }
-        let replacement = build_active(updated.easylist.clone(), updated.easyprivacy.clone());
+        let replacement = build_if_changed(
+            updated.easylist.clone(),
+            updated.easyprivacy.clone(),
+            self.revision(),
+        )
+        .await?;
         write_cache(&self.list_dir, &updated).await?;
-        *self.active.write().expect("ad filter lock poisoned") = replacement;
+        if let Some(replacement) = replacement {
+            self.install(replacement, true);
+        }
         Ok(())
+    }
+
+    // The mode check and swap share the write lock, so a stale build for the
+    // other mode can never replace the engine after the setting has flipped.
+    fn install(&self, replacement: ActiveFilter, from_cache: bool) {
+        let mut active = self.active.write().expect("ad filter lock poisoned");
+        if self.automatic_updates() == from_cache {
+            *active = replacement;
+        }
     }
 
     pub fn filter_fragment(&self, html: &str, base_url: Option<&str>) -> String {
@@ -179,9 +228,25 @@ impl AdFilter {
     }
 }
 
-fn read_cache(list_dir: &Path) -> Option<CachedLists> {
+fn read_valid_cache(list_dir: &Path) -> Option<CachedLists> {
     let value = std::fs::read(list_dir.join(CACHE_FILE)).ok()?;
-    serde_json::from_slice(&value).ok()
+    serde_json::from_slice(&value).ok().filter(is_valid_cache)
+}
+
+fn is_valid_cache(cached: &CachedLists) -> bool {
+    looks_like_filter_list(&cached.easylist, 1000)
+        && looks_like_filter_list(&cached.easyprivacy, 1000)
+}
+
+fn checked_recently(cached: &CachedLists) -> bool {
+    cached.checked_at.as_deref().is_some_and(|checked_at| {
+        chrono::DateTime::parse_from_rfc3339(checked_at)
+            .ok()
+            .is_some_and(|checked_at| {
+                chrono::Utc::now().signed_duration_since(checked_at.with_timezone(&chrono::Utc))
+                    < chrono::Duration::hours(24)
+            })
+    })
 }
 
 async fn write_cache(list_dir: &Path, cached: &CachedLists) -> AppResult<()> {
@@ -195,20 +260,43 @@ async fn write_cache(list_dir: &Path, cached: &CachedLists) -> AppResult<()> {
     Ok(())
 }
 
-fn build_active(easylist: String, easyprivacy: String) -> ActiveFilter {
-    let mut set = FilterSet::new(false);
-    set.add_filter_list(easylist.clone(), ParseOptions::default());
-    set.add_filter_list(easyprivacy.clone(), ParseOptions::default());
-    set.add_filter_list(VEILFEED_RULES.to_owned(), ParseOptions::default());
+/// Builds off the async runtime, skipping the build when `current` already matches.
+async fn build_if_changed(
+    easylist: String,
+    easyprivacy: String,
+    current: String,
+) -> AppResult<Option<ActiveFilter>> {
+    tokio::task::spawn_blocking(move || {
+        let revision = lists_revision(&easylist, &easyprivacy);
+        (revision != current).then(|| build_engine(easylist, easyprivacy, revision))
+    })
+    .await
+    .map_err(|error| AppError::Io(std::io::Error::other(error)))
+}
+
+fn lists_revision(easylist: &str, easyprivacy: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(POLICY_VERSION.as_bytes());
     hash.update([0]);
     hash.update(easylist.as_bytes());
     hash.update([0]);
     hash.update(easyprivacy.as_bytes());
+    hex::encode(hash.finalize())
+}
+
+fn build_active(easylist: String, easyprivacy: String) -> ActiveFilter {
+    let revision = lists_revision(&easylist, &easyprivacy);
+    build_engine(easylist, easyprivacy, revision)
+}
+
+fn build_engine(easylist: String, easyprivacy: String, revision: String) -> ActiveFilter {
+    let mut set = FilterSet::new(false);
+    set.add_filter_list(easylist, ParseOptions::default());
+    set.add_filter_list(easyprivacy, ParseOptions::default());
+    set.add_filter_list(VEILFEED_RULES.to_owned(), ParseOptions::default());
     ActiveFilter {
         engine: Engine::new_with_filter_set(set),
-        revision: hex::encode(hash.finalize()),
+        revision,
     }
 }
 
@@ -435,7 +523,7 @@ mod tests {
     #[test]
     fn bundled_lists_load_and_block_known_ad_hosts() {
         let directory = tempfile::tempdir().unwrap();
-        let filter = AdFilter::load(directory.path());
+        let filter = AdFilter::load(directory.path(), false);
         let output = filter.filter_fragment(
             r#"<img src="https://securepubads.g.doubleclick.net/banner.jpg"><p>Article</p>"#,
             Some("https://publisher.example/article"),
@@ -443,6 +531,43 @@ mod tests {
         assert!(!output.contains("doubleclick"));
         assert!(output.contains("Article"));
         assert_eq!(filter.revision().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn cached_lists_are_only_active_while_automatic_updates_are_enabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let list = |host: &str| {
+            let rules: Vec<String> = (0..1000)
+                .map(|index| format!("||{host}{index}.example^"))
+                .collect();
+            format!("[Adblock Plus 2.0]\n{}\n", rules.join("\n"))
+        };
+        let cached = CachedLists {
+            easylist: list("ads"),
+            easyprivacy: list("trackers"),
+            checked_at: Some(chrono::Utc::now().to_rfc3339()),
+            ..CachedLists::default()
+        };
+        write_cache(&directory.path().join("filter-lists"), &cached)
+            .await
+            .unwrap();
+        let bundled_revision = lists_revision(FALLBACK_EASYLIST, FALLBACK_EASYPRIVACY);
+        let cached_revision = lists_revision(&cached.easylist, &cached.easyprivacy);
+
+        assert_eq!(
+            AdFilter::load(directory.path(), true).revision(),
+            cached_revision
+        );
+        let filter = AdFilter::load(directory.path(), false);
+        assert_eq!(filter.revision(), bundled_revision);
+
+        // A recently checked cache activates without touching the network.
+        filter.set_automatic_updates(true).await.unwrap();
+        filter.refresh(&Network::new(), None).await.unwrap();
+        assert_eq!(filter.revision(), cached_revision);
+
+        filter.set_automatic_updates(false).await.unwrap();
+        assert_eq!(filter.revision(), bundled_revision);
     }
 
     #[test]

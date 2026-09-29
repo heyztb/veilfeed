@@ -6,4 +6,4 @@ src-tauri/target/
 *.db-shm
 *.db-wal
 bundle-report.json
-
+/target/

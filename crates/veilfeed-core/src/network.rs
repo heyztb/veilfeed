@@ -1,4 +1,10 @@
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use crate::{
     ad_filter::AdFilter,
@@ -55,20 +61,34 @@ fn public_addresses(host: &str, addresses: Vec<SocketAddr>) -> io::Result<Vec<So
     Ok(addresses)
 }
 
-fn redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        if let Err(error) = validate_redirect(attempt.url().as_str(), attempt.previous().len()) {
-            return attempt.error(error);
-        }
-        attempt.follow()
-    })
-}
-
-fn validate_redirect(url: &str, previous_hops: usize) -> AppResult<()> {
-    if previous_hops >= MAX_REDIRECTS {
+/// Fails once `visited` URLs (the original plus redirects already followed)
+/// reach `MAX_REDIRECTS`, or when the next hop is not a safe remote URL.
+fn validate_redirect(url: &str, visited: usize) -> AppResult<()> {
+    if visited >= MAX_REDIRECTS {
         return Err(AppError::UnsafeTarget("too many redirects".into()));
     }
     validate_remote_url(url).map(|_| ())
+}
+
+/// Mirrors reqwest's automatic Referer on redirects: never downgrade HTTPS
+/// to HTTP and never leak userinfo or fragments.
+fn redirect_referer(next: &url::Url, previous: &url::Url) -> Option<header::HeaderValue> {
+    if next.scheme() == "http" && previous.scheme() == "https" {
+        return None;
+    }
+    let mut referer = previous.clone();
+    let _ = referer.set_username("");
+    let _ = referer.set_password(None);
+    referer.set_fragment(None);
+    header::HeaderValue::from_str(referer.as_str()).ok()
+}
+
+fn request_error(profile: Option<&ProxyProfile>, error: reqwest::Error) -> AppError {
+    if profile.is_some_and(|p| p.kind != "direct") {
+        AppError::ProxyUnavailable(error.to_string())
+    } else {
+        AppError::Network(error)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,21 +125,74 @@ pub struct TextDownload {
 #[derive(Clone)]
 pub struct Network {
     slots: Arc<Semaphore>,
+    tor_tokens: Arc<Mutex<HashMap<(String, String), String>>>,
+}
+
+impl Default for Network {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Network {
     pub fn new() -> Self {
         Self {
             slots: Arc::new(Semaphore::new(6)),
+            tor_tokens: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    fn client(&self, profile: Option<&ProxyProfile>) -> AppResult<Client> {
+    fn tor_credentials(
+        &self,
+        profile: &ProxyProfile,
+        url: &str,
+        rotate: bool,
+    ) -> AppResult<(String, String)> {
+        validate_tor_profile(
+            &profile.kind,
+            profile.endpoint.as_deref(),
+            profile.username.as_deref(),
+            profile.remote_dns,
+        )?;
+        let host = url::Url::parse(url)
+            .map_err(|e| AppError::InvalidInput(e.to_string()))?
+            .host_str()
+            .ok_or_else(|| AppError::InvalidInput("A provider hostname is required".into()))?
+            .to_owned();
+        let mut tokens = self
+            .tor_tokens
+            .lock()
+            .map_err(|_| AppError::InvalidInput("Tor isolation state unavailable".into()))?;
+        let key = (profile.id.clone(), host);
+        if rotate {
+            tokens.insert(key.clone(), uuid::Uuid::new_v4().to_string());
+        }
+        let token = tokens
+            .entry(key)
+            .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .clone();
+        // Random credentials are isolation tokens, never publisher credentials.
+        Ok(("veilfeed".into(), token))
+    }
+
+    pub fn rotate_tor_circuit(&self, profile: &ProxyProfile, url: &str) -> AppResult<()> {
+        if !profile.tor_isolation {
+            return Err(AppError::InvalidInput(
+                "This feed does not use Tor isolation".into(),
+            ));
+        }
+        self.tor_credentials(profile, url, true)?;
+        Ok(())
+    }
+
+    fn client(&self, profile: Option<&ProxyProfile>, url: &str) -> AppResult<Client> {
         let mut builder = Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(45))
-            .redirect(redirect_policy())
+            // Redirects are followed by `get` so every hop gets a client (and
+            // Tor isolation credentials) built for that hop's host.
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!(
                 "Veilfeed/",
                 env!("CARGO_PKG_VERSION"),
@@ -128,7 +201,7 @@ impl Network {
 
         // Direct requests are resolved to the exact addresses reqwest will use,
         // closing DNS-rebinding races. Proxy profiles retain their configured
-        // local/remote DNS behavior; URL and redirect checks still apply.
+        // local/remote DNS behavior; URL checks still apply to every redirect hop.
         if profile.is_none_or(|profile| profile.kind == "direct") {
             builder = builder.dns_resolver(Arc::new(PublicDnsResolver));
         }
@@ -143,7 +216,10 @@ impl Network {
             }
             let mut proxy = reqwest::Proxy::all(&endpoint)
                 .map_err(|error| AppError::InvalidInput(error.to_string()))?;
-            if let Some(username) = profile.username.as_deref() {
+            if profile.tor_isolation {
+                let (username, password) = self.tor_credentials(profile, url, false)?;
+                proxy = proxy.basic_auth(&username, &password);
+            } else if let Some(username) = profile.username.as_deref() {
                 let service = format!("app.veilfeed.reader.proxy.{}", profile.id);
                 let password = keyring::Entry::new(&service, username)
                     .map_err(|error| AppError::Credential(error.to_string()))?
@@ -156,6 +232,56 @@ impl Network {
         builder.build().map_err(AppError::Network)
     }
 
+    /// Sends a GET to `url`, following up to `MAX_REDIRECTS` redirects one hop
+    /// at a time. Each hop is validated and sent through a client built for
+    /// that hop's URL, so the direct-profile DNS guard and per-host Tor
+    /// isolation credentials always match the host being contacted.
+    ///
+    /// Only GETs are issued, so 301/302/303/307/308 all repeat a GET. `headers`
+    /// never carry Authorization or Cookie (proxy credentials live on the
+    /// client), so nothing needs stripping on cross-host hops.
+    async fn get(
+        &self,
+        url: &str,
+        profile: Option<&ProxyProfile>,
+        mut headers: header::HeaderMap,
+    ) -> AppResult<reqwest::Response> {
+        let mut current = validate_remote_url(url)?;
+        let mut visited = 0;
+        loop {
+            let response = self
+                .client(profile, current.as_str())?
+                .get(current.as_str())
+                .headers(headers.clone())
+                .send()
+                .await
+                .map_err(|error| request_error(profile, error))?;
+            let followed = matches!(
+                response.status(),
+                reqwest::StatusCode::MOVED_PERMANENTLY
+                    | reqwest::StatusCode::FOUND
+                    | reqwest::StatusCode::SEE_OTHER
+                    | reqwest::StatusCode::TEMPORARY_REDIRECT
+                    | reqwest::StatusCode::PERMANENT_REDIRECT
+            );
+            let next = followed
+                .then(|| response.headers().get(header::LOCATION))
+                .flatten()
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| current.join(location).ok());
+            let Some(next) = next else {
+                return Ok(response);
+            };
+            visited += 1;
+            validate_redirect(next.as_str(), visited)?;
+            match redirect_referer(&next, &current) {
+                Some(referer) => headers.insert(header::REFERER, referer),
+                None => headers.remove(header::REFERER),
+            };
+            current = next;
+        }
+    }
+
     async fn bytes_with_limit(
         &self,
         url: &str,
@@ -164,28 +290,26 @@ impl Network {
         max_bytes: usize,
         article_navigation: bool,
     ) -> AppResult<(Vec<u8>, header::HeaderMap, reqwest::StatusCode)> {
-        validate_remote_url(url)?;
         let _permit = self.slots.acquire().await.expect("semaphore remains open");
-        let client = self.client(profile)?;
-        let mut request = client.get(url);
-        if article_navigation {
-            request = request.headers(article_navigation_headers());
-        }
+        let mut headers = if article_navigation {
+            article_navigation_headers()
+        } else {
+            header::HeaderMap::new()
+        };
         if let Some((etag, modified)) = validators {
-            if !etag.is_empty() {
-                request = request.header(header::IF_NONE_MATCH, etag);
-            }
-            if !modified.is_empty() {
-                request = request.header(header::IF_MODIFIED_SINCE, modified);
+            for (name, value) in [
+                (header::IF_NONE_MATCH, etag),
+                (header::IF_MODIFIED_SINCE, modified),
+            ] {
+                if !value.is_empty() {
+                    let value = header::HeaderValue::from_str(value).map_err(|_| {
+                        AppError::InvalidInput(format!("invalid cached {name} validator"))
+                    })?;
+                    headers.insert(name, value);
+                }
             }
         }
-        let response = request.send().await.map_err(|error| {
-            if profile.is_some_and(|p| p.kind != "direct") {
-                AppError::ProxyUnavailable(error.to_string())
-            } else {
-                AppError::Network(error)
-            }
-        })?;
+        let response = self.get(url, profile, headers).await?;
         let status = response.status();
         let headers = response.headers().clone();
         if status == reqwest::StatusCode::NOT_MODIFIED {
@@ -299,17 +423,8 @@ impl Network {
 
     pub async fn test_connection(&self, profile: Option<&ProxyProfile>) -> AppResult<()> {
         let _permit = self.slots.acquire().await.expect("semaphore remains open");
-        self.client(profile)?
-            .get("https://example.com/")
-            .send()
-            .await
-            .map_err(|error| {
-                if profile.is_some_and(|p| p.kind != "direct") {
-                    AppError::ProxyUnavailable(error.to_string())
-                } else {
-                    AppError::Network(error)
-                }
-            })?
+        self.get("https://example.com/", profile, header::HeaderMap::new())
+            .await?
             .error_for_status()?;
         Ok(())
     }
@@ -382,20 +497,10 @@ impl Network {
         url: &str,
         profile: Option<&ProxyProfile>,
     ) -> AppResult<(Vec<u8>, String, Option<String>, Option<String>)> {
-        validate_remote_url(url)?;
         let _permit = self.slots.acquire().await.expect("semaphore remains open");
         let response = self
-            .client(profile)?
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| {
-                if profile.is_some_and(|p| p.kind != "direct") {
-                    AppError::ProxyUnavailable(error.to_string())
-                } else {
-                    AppError::Network(error)
-                }
-            })?
+            .get(url, profile, header::HeaderMap::new())
+            .await?
             .error_for_status()?;
         let headers = response.headers().clone();
         let mime = headers
@@ -460,6 +565,29 @@ fn article_navigation_headers() -> header::HeaderMap {
         header::HeaderValue::from_static("en-US,en;q=0.5"),
     );
     headers
+}
+
+pub(crate) fn validate_tor_profile(
+    kind: &str,
+    endpoint: Option<&str>,
+    username: Option<&str>,
+    remote_dns: bool,
+) -> AppResult<()> {
+    let endpoint = endpoint.and_then(|value| url::Url::parse(value).ok());
+    if kind != "socks5"
+        || !remote_dns
+        || username.is_some_and(|value| !value.is_empty())
+        || endpoint.as_ref().is_none_or(|value| {
+            !matches!(value.scheme(), "socks5" | "socks5h")
+                || !value.username().is_empty()
+                || value.password().is_some()
+        })
+    {
+        return Err(AppError::InvalidInput(
+            "Tor isolation requires a SOCKS5 endpoint with remote DNS and no proxy login".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_socks_dns(endpoint: &str, remote_dns: bool) -> String {
@@ -653,6 +781,274 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    fn tor_profile(id: &str) -> ProxyProfile {
+        ProxyProfile {
+            id: id.into(),
+            name: "Tor".into(),
+            kind: "socks5".into(),
+            endpoint: Some("socks5h://127.0.0.1:9050".into()),
+            username: None,
+            remote_dns: true,
+            tor_isolation: true,
+        }
+    }
+
+    #[test]
+    fn tor_rotation_only_changes_the_selected_profile_and_hostname() {
+        let network = Network::new();
+        let profile = tor_profile("tor");
+        let credentials = network
+            .tor_credentials(&profile, "https://example.com/feed", false)
+            .unwrap();
+        assert_eq!(
+            credentials,
+            network
+                .clone()
+                .tor_credentials(&profile, "https://EXAMPLE.com/article", false)
+                .unwrap()
+        );
+        let other_host = network
+            .tor_credentials(&profile, "https://other.example/feed", false)
+            .unwrap();
+        let other_profile = tor_profile("tor-browser");
+        let other_credentials = network
+            .tor_credentials(&other_profile, "https://example.com/feed", false)
+            .unwrap();
+        assert_ne!(credentials, other_host);
+        assert_ne!(credentials, other_credentials);
+        network
+            .rotate_tor_circuit(&profile, "https://example.com/feed")
+            .unwrap();
+        assert_ne!(
+            credentials,
+            network
+                .tor_credentials(&profile, "https://example.com/feed", false)
+                .unwrap()
+        );
+        assert_eq!(
+            other_host,
+            network
+                .tor_credentials(&profile, "https://other.example/feed", false)
+                .unwrap()
+        );
+        assert_eq!(
+            other_credentials,
+            network
+                .tor_credentials(&other_profile, "https://example.com/feed", false)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn tor_isolation_rejects_incompatible_proxy_settings() {
+        for (kind, endpoint, username, remote_dns) in [
+            ("http", "http://127.0.0.1:9050", None, true),
+            (
+                "socks5",
+                "socks5h://user:password@127.0.0.1:9050",
+                None,
+                true,
+            ),
+            ("socks5", "socks5h://127.0.0.1:9050", Some("login"), true),
+            ("socks5", "socks5://127.0.0.1:9050", None, false),
+        ] {
+            assert!(validate_tor_profile(kind, Some(endpoint), username, remote_dns).is_err());
+        }
+        let network = Network::new();
+        let mut profile = tor_profile("generic");
+        profile.tor_isolation = false;
+        assert!(
+            network
+                .rotate_tor_circuit(&profile, "https://example.com")
+                .is_err()
+        );
+    }
+
+    struct SocksConnection {
+        credentials: Option<(Vec<u8>, Vec<u8>)>,
+        host: String,
+        request: String,
+    }
+
+    /// Fake SOCKS5 proxy accepting one connection per canned HTTP response. It
+    /// records the SOCKS credentials, CONNECT hostname and HTTP request head.
+    /// An empty response rejects the CONNECT instead of tunnelling.
+    fn spawn_socks_proxy(
+        responses: Vec<String>,
+    ) -> (String, std::thread::JoinHandle<Vec<SocksConnection>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("socks5h://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|response| {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut greeting = [0; 2];
+                    socket.read_exact(&mut greeting).unwrap();
+                    assert_eq!(greeting[0], 5);
+                    let mut methods = vec![0; greeting[1] as usize];
+                    socket.read_exact(&mut methods).unwrap();
+                    let credentials = if methods.contains(&2) {
+                        socket.write_all(&[5, 2]).unwrap();
+                        let mut auth = [0; 2];
+                        socket.read_exact(&mut auth).unwrap();
+                        assert_eq!(auth[0], 1);
+                        let mut username = vec![0; auth[1] as usize];
+                        socket.read_exact(&mut username).unwrap();
+                        let mut size = [0];
+                        socket.read_exact(&mut size).unwrap();
+                        let mut password = vec![0; size[0] as usize];
+                        socket.read_exact(&mut password).unwrap();
+                        socket.write_all(&[1, 0]).unwrap();
+                        Some((username, password))
+                    } else {
+                        socket.write_all(&[5, 0]).unwrap();
+                        None
+                    };
+                    let mut connect = [0; 5];
+                    socket.read_exact(&mut connect).unwrap();
+                    assert_eq!(&connect[..4], &[5, 1, 0, 3]);
+                    let mut hostname = vec![0; connect[4] as usize];
+                    socket.read_exact(&mut hostname).unwrap();
+                    let mut port = [0; 2];
+                    socket.read_exact(&mut port).unwrap();
+                    let host = String::from_utf8(hostname).unwrap();
+                    if response.is_empty() {
+                        socket.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+                        return SocksConnection {
+                            credentials,
+                            host,
+                            request: String::new(),
+                        };
+                    }
+                    socket.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        socket.read_exact(&mut byte).unwrap();
+                        request.push(byte[0]);
+                    }
+                    socket.write_all(response.as_bytes()).unwrap();
+                    SocksConnection {
+                        credentials,
+                        host,
+                        request: String::from_utf8(request).unwrap(),
+                    }
+                })
+                .collect()
+        });
+        (endpoint, server)
+    }
+
+    fn redirect_response(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn sends_rotated_isolation_tokens_and_remote_hostname_over_socks() {
+        let (endpoint, server) = spawn_socks_proxy(vec![String::new(); 3]);
+        let mut profile = tor_profile("wire-test");
+        profile.endpoint = Some(endpoint);
+        let network = Network::new();
+        for attempt in 0..3 {
+            if attempt == 2 {
+                network
+                    .rotate_tor_circuit(&profile, "https://example.com/feed")
+                    .unwrap();
+            }
+            assert!(
+                network
+                    .get(
+                        "https://example.com/feed",
+                        Some(&profile),
+                        header::HeaderMap::new()
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let observed = server.join().unwrap();
+        assert!(observed.iter().all(|c| c.host == "example.com"));
+        assert!(observed[0].credentials.is_some());
+        assert_eq!(observed[0].credentials, observed[1].credentials);
+        assert_ne!(observed[1].credentials, observed[2].credentials);
+    }
+
+    #[tokio::test]
+    async fn isolates_each_redirect_hop_by_its_own_hostname() {
+        let (endpoint, server) = spawn_socks_proxy(vec![
+            redirect_response("http://second.example/feed"),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                .into(),
+        ]);
+        let mut profile = tor_profile("redirect-test");
+        profile.endpoint = Some(endpoint);
+        let network = Network::new();
+        let body = network
+            .download_text_limited("http://first.example/feed", Some(&profile), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body, "ok");
+        let observed = server.join().unwrap();
+        let hosts = observed.iter().map(|c| c.host.as_str()).collect::<Vec<_>>();
+        assert_eq!(hosts, ["first.example", "second.example"]);
+        for (connection, url) in observed
+            .iter()
+            .zip(["http://first.example/", "http://second.example/"])
+        {
+            let (username, password) = network.tor_credentials(&profile, url, false).unwrap();
+            assert_eq!(
+                connection.credentials,
+                Some((username.into_bytes(), password.into_bytes()))
+            );
+        }
+        assert_ne!(observed[0].credentials, observed[1].credentials);
+        assert!(
+            observed[1]
+                .request
+                .to_ascii_lowercase()
+                .contains("\r\nreferer: http://first.example/feed\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn redirects_without_isolation_stay_bounded() {
+        let (endpoint, server) =
+            spawn_socks_proxy(vec![redirect_response("/again"); MAX_REDIRECTS]);
+        let mut profile = tor_profile("plain-socks");
+        profile.tor_isolation = false;
+        profile.endpoint = Some(endpoint);
+        let result = Network::new()
+            .download_text_limited("http://loop.example/feed", Some(&profile), 1024)
+            .await;
+        assert!(matches!(result, Err(AppError::UnsafeTarget(_))));
+        let observed = server.join().unwrap();
+        assert!(
+            observed
+                .iter()
+                .all(|c| c.credentials.is_none() && c.host == "loop.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_redirect_hops_to_private_targets() {
+        let (endpoint, server) =
+            spawn_socks_proxy(vec![redirect_response("http://127.0.0.1/admin")]);
+        let mut profile = tor_profile("private-redirect");
+        profile.endpoint = Some(endpoint);
+        let result = Network::new()
+            .download_text_limited("http://public.example/feed", Some(&profile), 1024)
+            .await;
+        assert!(matches!(result, Err(AppError::UnsafeTarget(_))));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
     #[test]
     fn rejects_dns_answers_containing_private_addresses() {
         let addresses = vec![
@@ -683,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn redirect_policy_rejects_private_targets() {
+    fn redirect_hops_reject_private_targets_and_excess_redirects() {
         assert!(validate_redirect("http://127.0.0.1/admin", 1).is_err());
         assert!(validate_redirect("https://example.com/next", 1).is_ok());
         assert!(validate_redirect("https://example.com/next", MAX_REDIRECTS).is_err());

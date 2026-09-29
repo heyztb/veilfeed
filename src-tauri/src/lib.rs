@@ -1,32 +1,17 @@
-mod ad_filter;
 mod commands;
-mod content;
-mod db;
-mod error;
 mod media;
-mod models;
-mod network;
-mod opml;
-mod release;
 
-use std::{path::PathBuf, sync::Arc};
-
-use db::Database;
-use network::Network;
 use tauri::Manager;
-use tokio::time::{Duration, sleep};
-
-#[derive(Clone)]
-pub struct AppState {
-    db: Database,
-    network: Network,
-    ad_filter: ad_filter::AdFilter,
-    refresh_guard: Arc<tokio::sync::Mutex<()>>,
-    cache_dir: PathBuf,
-}
+use veilfeed_core::{AppService, lifecycle::BackgroundTasks};
+type AppState = AppService;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("could not start background runtime");
+    tauri::async_runtime::set(runtime.handle().clone());
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
@@ -44,44 +29,11 @@ pub fn run() {
         })
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
-            let database =
-                tauri::async_runtime::block_on(Database::open(&data_dir.join("veilfeed.db")))
-                    .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
-            let cache_dir = data_dir.join("media-cache");
-            tauri::async_runtime::block_on(database.prune_unowned_media(&cache_dir))
-                .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
-            let ad_filter = ad_filter::AdFilter::load(&data_dir);
-            app.manage(AppState {
-                db: database,
-                network: Network::new(),
-                ad_filter,
-                refresh_guard: Arc::new(tokio::sync::Mutex::new(())),
-                cache_dir,
-            });
-            let state = app.state::<AppState>().inner().clone();
-            tauri::async_runtime::spawn(async move {
-                loop {
-                    match state.db.proxy(None).await {
-                        Ok(profile) => {
-                            if let Err(error) = state
-                                .ad_filter
-                                .refresh(&state.network, profile.as_ref())
-                                .await
-                            {
-                                eprintln!(
-                                    "blocker-list update failed; retaining current rules: {error}"
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "blocker-list route unavailable; retaining current rules: {error}"
-                            );
-                        }
-                    }
-                    sleep(Duration::from_secs(60 * 60)).await;
-                }
-            });
+            let service = tauri::async_runtime::block_on(AppService::open(&data_dir))?;
+            let tasks =
+                tauri::async_runtime::block_on(async { BackgroundTasks::start(service.clone()) });
+            app.manage(std::sync::Mutex::new(tasks));
+            app.manage(service);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -110,6 +62,8 @@ pub fn run() {
             commands::import_opml,
             commands::export_opml,
             commands::check_for_update,
+            commands::get_automatic_blocklist_updates,
+            commands::set_automatic_blocklist_updates,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Veilfeed");

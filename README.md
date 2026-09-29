@@ -13,7 +13,7 @@ Tauri 2.
 deno install
 deno task check
 deno task test
-cargo test --manifest-path src-tauri/Cargo.toml
+cargo test --locked --workspace
 deno task tauri dev
 ```
 
@@ -49,7 +49,24 @@ for the one-time GitHub setup and release checklist.
 - Scripted embeds are removed. External links require confirmation and open in
   the system browser by default. Tor Browser can be selected in Settings and
   uses its own Tor connection rather than Veilfeed's proxy.
-- Proxy credentials are stored in macOS Keychain; the SQLite database relies on
-  normal filesystem permissions and FileVault.
+- Proxy credentials are stored in macOS Keychain. The app-data directory is
+  owner-only (0700) and the SQLite database and new media files are owner-only
+  (0600). Reading history remains plaintext within that directory; FileVault
+  protects it at rest when enabled, and unencrypted backups can still expose it.
+- Bundled blocking rules work offline. Automatic EasyList/EasyPrivacy updates
+  are opt-in and use the default connection profile; while they are off, the
+  bundled rules are active even if lists were downloaded earlier.
 
 The database and media cache live in the platform application-data directory.
+
+Tor profiles isolate new connections by provider hostname using SOCKS authentication
+tokens. In Edit subscription, **New Tor circuit and retry** rotates that hostname’s
+token and refreshes the saved feed. Other hostnames retain their tokens; feeds sharing
+the hostname and connection profile use the new token on future requests. Tokens are
+kept in memory and reset when Veilfeed restarts. Cached articles and media remain cached.
+
+Custom Tor profiles can enable **Tor circuit isolation by provider** in Settings.
+The Tor SOCKS port must have `IsolateSOCKSAuth` enabled (the standard Tor default).
+Isolation uses remote DNS and replaces proxy login credentials, so enable it only
+for Tor endpoints. No control port is required. A new circuit does not guarantee a
+different exit IP or country. Rotation is manual; HTTP errors do not trigger it automatically.

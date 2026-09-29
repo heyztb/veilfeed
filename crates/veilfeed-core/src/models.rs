@@ -9,6 +9,8 @@ pub struct ProxyProfile {
     pub endpoint: Option<String>,
     pub username: Option<String>,
     pub remote_dns: bool,
+    #[serde(default)]
+    pub tor_isolation: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -21,6 +23,8 @@ pub struct SaveProxyInput {
     pub username: Option<String>,
     pub password: Option<String>,
     pub remote_dns: bool,
+    #[serde(default)]
+    pub tor_isolation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]

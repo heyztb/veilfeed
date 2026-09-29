@@ -238,6 +238,7 @@ mod tests {
             endpoint: Some("socks5h://127.0.0.1:1".into()),
             username: None,
             remote_dns: true,
+            tor_isolation: false,
         };
         let error = check_repository(&Network::new(), Some(&profile), "acme/veilfeed")
             .await
