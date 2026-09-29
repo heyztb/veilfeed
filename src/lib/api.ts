@@ -27,6 +27,9 @@ async function call<T>(
 
 export const api = {
   appVersion: () => call<string>("app_version"),
+  automaticBlocklistUpdates: () => call<boolean>("get_automatic_blocklist_updates"),
+  setAutomaticBlocklistUpdates: (enabled: boolean) =>
+    call<void>("set_automatic_blocklist_updates", { enabled }),
   sidebar: () => call<SidebarData>("get_sidebar"),
   articles: (query: ArticleQuery) =>
     call<ArticlePage>("list_articles", { query }),
@@ -74,8 +77,8 @@ export const api = {
     call<string[]>("discover_feed", { url, proxyProfileId }),
   subscribe: (input: SubscribeInput) =>
     call<SubscribeResult>("subscribe", { input }),
-  refresh: (feedId?: string, dueOnly = false) =>
-    call<RefreshResult>("refresh_feeds", { feedId, dueOnly }),
+  refresh: (feedId?: string, dueOnly = false, newTorCircuit = false) =>
+    call<RefreshResult>("refresh_feeds", { feedId, dueOnly, newTorCircuit }),
   fullContent: (articleId: string) =>
     call<string>("fetch_full_content", { articleId }),
   previewOpml: (xml: string) => call<OpmlPreview>("preview_opml", { xml }),

@@ -18,14 +18,15 @@
   let externalBrowser = $state<ExternalBrowser>(getExternalBrowser());
   let vimNavigation = $state(vimNavigationEnabled());
   let editing = $state<ProxyProfile | undefined>();
-  let name = $state(""); let kind = $state("socks5"); let endpoint = $state(""); let username = $state(""); let password = $state(""); let remoteDns = $state(true);
+  let name = $state(""); let kind = $state("socks5"); let endpoint = $state(""); let username = $state(""); let password = $state(""); let remoteDns = $state(true); let torIsolation = $state(false);
   let notificationEnabled = $state(notificationsEnabled()); let notificationBusy = $state(false); let notificationError = $state("");
   let updateChecksEnabled = $state(automaticUpdateChecksEnabled()); let updateBusy = $state(false); let updateError = $state(""); let checkedRelease = $state<ReleaseCheck>(); let checkedAt = $state(lastUpdateCheckAt()); let currentVersion = $state("");
+  let blocklistUpdatesEnabled = $state(false); let blocklistBusy = $state(true); let blocklistError = $state("");
   let displayedRelease = $derived(checkedRelease ?? releaseCheck);
   let error = $state(""); let busy = $state(false); let defaultProxyId = $state(untrack(() => defaultProxyProfileId)); let defaultProxyBusy = $state(false); let defaultProxyError = $state("");
   let opmlPreview = $state<OpmlPreview>(); let opmlProxyId = $state(untrack(() => defaultProxyProfileId)); let opmlBusy = $state(false); let opmlMessage = $state(""); let opmlError = $state("");
 
-  function edit(p?: ProxyProfile) { editing = p; name = p?.name ?? ""; kind = p?.kind ?? "socks5"; endpoint = p?.endpoint ?? ""; username = p?.username ?? ""; password = ""; remoteDns = p?.remoteDns ?? true; error = ""; }
+  function edit(p?: ProxyProfile) { editing = p; name = p?.name ?? ""; kind = p?.kind ?? "socks5"; endpoint = p?.endpoint ?? ""; username = p?.username ?? ""; password = ""; remoteDns = p?.remoteDns ?? true; torIsolation = p?.torIsolation ?? false; error = ""; }
   function selectTheme(value: Theme) { theme = value; applyTheme(value); }
   function selectReaderFont(value: ReaderFont) { readerFont = value; applyReaderFont(value); }
   function selectExternalBrowser(value: ExternalBrowser) { externalBrowser = value; setExternalBrowser(value); }
@@ -53,6 +54,15 @@
     setAutomaticUpdateChecksEnabled(updateChecksEnabled);
     onupdatepreferencechanged();
   }
+  async function toggleBlocklistUpdates() {
+    blocklistBusy = true; blocklistError = "";
+    try {
+      const enabled = !blocklistUpdatesEnabled;
+      await api.setAutomaticBlocklistUpdates(enabled);
+      blocklistUpdatesEnabled = enabled;
+    } catch (e) { blocklistError = (e as { message?: string }).message ?? String(e); }
+    finally { blocklistBusy = false; }
+  }
   async function checkUpdates() {
     if (updateBusy) return;
     updateBusy = true; updateError = "";
@@ -62,7 +72,7 @@
   }
   async function save() {
     busy = true; error = "";
-    try { await api.saveProxy({ id: editing?.id, name, kind, endpoint: kind === "direct" ? null : endpoint, username: username || null, password: password || null, remoteDns }); await onchanged(); edit(); }
+    try { await api.saveProxy({ id: editing?.id, name, kind, endpoint: kind === "direct" ? null : endpoint, username: kind === "socks5" && torIsolation ? null : username || null, password: kind === "socks5" && torIsolation ? null : password || null, remoteDns: kind === "socks5" && torIsolation ? true : remoteDns, torIsolation: kind === "socks5" && torIsolation }); await onchanged(); edit(); }
     catch (e) { error = (e as { message: string }).message; }
     finally { busy = false; }
   }
@@ -103,7 +113,12 @@
     } catch (e) { opmlError = (e as { message: string }).message; }
     finally { opmlBusy = false; }
   }
-  onMount(() => { void api.appVersion().then((version) => currentVersion = version).catch(() => {}); });
+  onMount(() => {
+    void api.appVersion().then((version) => currentVersion = version).catch(() => {});
+    void api.automaticBlocklistUpdates().then((enabled) => blocklistUpdatesEnabled = enabled)
+      .catch((e) => blocklistError = (e as { message?: string }).message ?? String(e))
+      .finally(() => blocklistBusy = false);
+  });
 </script>
 
 <div class="backdrop" role="presentation" onclick={(event) => event.target === event.currentTarget && onclose()}>
@@ -123,13 +138,16 @@
             <div class="heading"><div><h3>Connection profiles</h3><p>Feeds fail closed when their assigned connection is unavailable.</p></div><button class="primary" onclick={() => edit(undefined)}>New profile</button></div>
             <label>Default connection for new feeds<select value={defaultProxyId} onchange={(event) => selectDefaultProxy(event.currentTarget.value)} disabled={defaultProxyBusy} aria-busy={defaultProxyBusy}>{#each proxies as proxy}<option value={proxy.id}>{proxy.name}</option>{/each}</select></label>
             <p class="setting-note">Preselected for new subscriptions and imports. Existing feeds keep their assigned connection.</p>
+            <div class="setting-card"><div><b>Update blocker lists automatically</b><span>Contact EasyList and EasyPrivacy through the default connection when turned on, at startup, and at most once per day. Bundled lists remain active when this is off.</span></div><button class:enabled={blocklistUpdatesEnabled} class="toggle" role="switch" aria-checked={blocklistUpdatesEnabled} aria-label="Update blocker lists automatically" disabled={blocklistBusy} aria-busy={blocklistBusy} onclick={toggleBlocklistUpdates}><span></span></button></div>
+            {#if blocklistError}<p class="error" role="alert">{blocklistError}</p>{/if}
             {#if defaultProxyError}<p class="error" role="alert">{defaultProxyError}</p>{/if}
             <div class="profiles">{#each proxies as proxy}<button onclick={() => edit(proxy)}><b>{proxy.name}</b><span>{proxy.kind === "direct" ? "No proxy" : proxy.endpoint}</span><em>{proxy.remoteDns ? "Remote DNS" : ""}</em></button>{/each}</div>
             {#if editing !== undefined || name !== ""}
               <form onsubmit={(event) => { event.preventDefault(); save(); }}>
                 <label>Name<input bind:value={name} required /></label>
                 <div class="row"><label>Type<select bind:value={kind}><option value="http">HTTP</option><option value="socks5">SOCKS5 / Tor</option><option value="direct">Direct</option></select></label>{#if kind !== "direct"}<label>Endpoint<input bind:value={endpoint} placeholder="socks5h://127.0.0.1:9050" required /></label>{/if}</div>
-                {#if kind !== "direct"}<div class="row"><label>Username<input bind:value={username} /></label><label>Password<input type="password" bind:value={password} placeholder="Unchanged if empty" /></label></div><label class="check"><input type="checkbox" bind:checked={remoteDns} /> Resolve hostnames through the proxy</label>{/if}
+                {#if kind === "socks5"}<label class="check"><input type="checkbox" bind:checked={torIsolation} /> Tor circuit isolation by provider</label><p class="setting-note">Enable only for Tor with SOCKS authentication isolation (IsolateSOCKSAuth). Uses remote DNS and allows requesting a new circuit for a feed.</p>{/if}
+                {#if kind !== "direct"}{#if kind !== "socks5" || !torIsolation}<div class="row"><label>Username<input bind:value={username} /></label><label>Password<input type="password" bind:value={password} placeholder="Unchanged if empty" /></label></div><label class="check"><input type="checkbox" bind:checked={remoteDns} /> Resolve hostnames through the proxy</label>{/if}{/if}
                 {#if error}<p class="error" role="alert">{error}</p>{/if}<div class="form-actions"><button type="button" class="secondary" onclick={() => edit()}>Cancel</button><button class="primary" disabled={busy} aria-busy={busy}>{busy ? "Saving…" : "Save profile"}</button></div>
               </form>
             {/if}

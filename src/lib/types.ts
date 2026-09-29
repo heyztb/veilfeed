@@ -9,6 +9,7 @@ export interface ProxyProfile {
   endpoint?: string;
   username?: string;
   remoteDns: boolean;
+  torIsolation: boolean;
 }
 export interface FolderSummary {
   id: string;
