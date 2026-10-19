@@ -56,7 +56,10 @@
     onclose();
     item.action();
   }
-  $effect(() => () => queueMicrotask(() => returnFocus?.focus()));
+  $effect(() => {
+    const target = returnFocus;
+    return () => queueMicrotask(() => target?.focus());
+  });
 </script>
 
 <svelte:window onpointerdown={outside} onkeydown={keydown} onresize={onclose}/>

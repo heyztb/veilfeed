@@ -4,9 +4,9 @@
   import ContextMenu from "./ContextMenu.svelte";
   import { adjacentIndex } from "../lib/keyboardNavigation";
   import type { Scope, SidebarData } from "../lib/types";
-  let { data, selection, vimNavigationEnabled, onselect, onadd, oncreatefolder, onrenamefolder, ondeletefolder, onrefresh, onsettings, onmove, onmanage, onmarkread, refreshing }: {
+  let { data, selection, vimNavigationEnabled, onselect, onadd, oncreatefolder, onrenamefolder, ondeletefolder, onrefresh, onsettings, onmove, onmanage, ondeletefeed, onmarkread, refreshing }: {
     data: SidebarData; selection: { scope: Scope; id?: string }; onselect: (scope: Scope, id?: string) => void;
-    vimNavigationEnabled: boolean; onadd: () => void; oncreatefolder: (feedId?: string) => void; onrenamefolder: (folderId: string) => void; ondeletefolder: (folderId: string) => void; onrefresh: (feedId?: string) => void; onsettings: () => void; onmove: (feedId:string,folderId?:string)=>void; onmanage:(feedId:string)=>void; onmarkread:(scope:Scope,id?:string)=>void; refreshing: boolean;
+    vimNavigationEnabled: boolean; onadd: () => void; oncreatefolder: (feedId?: string) => void; onrenamefolder: (folderId: string) => void; ondeletefolder: (folderId: string) => void; onrefresh: (feedId?: string) => void; onsettings: () => void; onmove: (feedId:string,folderId?:string)=>void; onmanage:(feedId:string)=>void; ondeletefeed:(feedId:string)=>void; onmarkread:(scope:Scope,id?:string)=>void; refreshing: boolean;
   } = $props();
   const active = (scope: Scope, id?: string) => selection.scope === scope && selection.id === id;
   type MenuTarget = { x: number; y: number; trigger: HTMLElement; scope: Scope; id?: string; label: string; canMarkRead: boolean; manageable?: boolean };
@@ -47,7 +47,10 @@
         { label: "Rename folder", icon: "settings", separatorBefore: true, action: () => onrenamefolder(target.id!) },
         { label: "Delete folder…", icon: "trash", action: () => ondeletefolder(target.id!) },
       ] : []),
-      ...(target.manageable ? [{ label: "Manage subscription", icon: "settings", separatorBefore: true, action: () => onmanage(target.id!) }] : []),
+      ...(target.manageable ? [
+        { label: "Manage subscription", icon: "settings", separatorBefore: true, action: () => onmanage(target.id!) },
+        { label: "Delete subscription…", icon: "trash", action: () => ondeletefeed(target.id!) },
+      ] : []),
     ];
   });
   function openMenu(event: MouseEvent | KeyboardEvent, target: Omit<MenuTarget, "x" | "y" | "trigger">) {
