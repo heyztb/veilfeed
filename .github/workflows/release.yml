@@ -164,7 +164,7 @@ jobs:
             xcrun stapler validate "$DMG_PATH"
           fi
           EXECUTABLE="$(find "$APP_PATH/Contents/MacOS" -type f -perm +111 -print -quit)"
-          lipo -verify_arch "$EXPECTED_ARCH" "$EXECUTABLE"
+          lipo "$EXECUTABLE" -verify_arch "$EXPECTED_ARCH"
           if [[ "$(uname -m)" == "$EXPECTED_ARCH" ]]; then
             "$EXECUTABLE" > "$RUNNER_TEMP/veilfeed-smoke.log" 2>&1 &
             APP_PID=$!
