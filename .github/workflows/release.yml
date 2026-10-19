@@ -147,10 +147,16 @@ jobs:
           TARGET: ${{ matrix.target }}
           EXPECTED_ARCH: ${{ matrix.expected-arch }}
         run: |
-          BUNDLE_ROOT="target/$TARGET/release/bundle"
-          APP_PATH="$(find "$BUNDLE_ROOT/macos" -maxdepth 1 -name '*.app' -print -quit)"
-          DMG_PATH="$(find "$BUNDLE_ROOT/dmg" -maxdepth 1 -name '*.dmg' -print -quit)"
-          test -n "$APP_PATH" && test -n "$DMG_PATH"
+          # `--bundles dmg` deletes the intermediate .app after packaging, so
+          # verify the copy users actually receive: the one inside the DMG.
+          DMG_PATH="$(find "target/$TARGET/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$DMG_PATH"
+          MOUNT_PATH="$RUNNER_TEMP/veilfeed-${{ matrix.label }}"
+          mkdir -p "$MOUNT_PATH"
+          hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT_PATH" "$DMG_PATH"
+          trap 'hdiutil detach "$MOUNT_PATH"' EXIT
+          APP_PATH="$(find "$MOUNT_PATH" -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$APP_PATH"
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           if [[ "$SIGNED" == "true" ]]; then
             spctl --assess --type execute --verbose=2 "$APP_PATH"
@@ -159,29 +165,21 @@ jobs:
           fi
           EXECUTABLE="$(find "$APP_PATH/Contents/MacOS" -type f -perm +111 -print -quit)"
           lipo -verify_arch "$EXPECTED_ARCH" "$EXECUTABLE"
-          MOUNT_PATH="$RUNNER_TEMP/veilfeed-${{ matrix.label }}"
-          mkdir -p "$MOUNT_PATH"
-          hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT_PATH" "$DMG_PATH"
-          trap 'hdiutil detach "$MOUNT_PATH"' EXIT
-          MOUNTED_APP="$(find "$MOUNT_PATH" -maxdepth 1 -name '*.app' -print -quit)"
-          codesign --verify --deep --strict --verbose=2 "$MOUNTED_APP"
-          if [[ "$SIGNED" == "true" ]]; then
-            spctl --assess --type execute --verbose=2 "$MOUNTED_APP"
-          fi
           if [[ "$(uname -m)" == "$EXPECTED_ARCH" ]]; then
-            MOUNTED_EXECUTABLE="$(find "$MOUNTED_APP/Contents/MacOS" -type f -perm +111 -print -quit)"
-            "$MOUNTED_EXECUTABLE" > "$RUNNER_TEMP/veilfeed-smoke.log" 2>&1 &
+            "$EXECUTABLE" > "$RUNNER_TEMP/veilfeed-smoke.log" 2>&1 &
             APP_PID=$!
             sleep 5
             kill -0 "$APP_PID"
             kill "$APP_PID"
             wait "$APP_PID" || true
           fi
+          mkdir -p "$RUNNER_TEMP/diagnostics"
+          ditto "$APP_PATH" "$RUNNER_TEMP/diagnostics/$(basename "$APP_PATH")"
       - name: Retain application bundle for diagnostics
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: Veilfeed-${{ needs.prepare.outputs.version }}-${{ matrix.label }}-app
-          path: target/${{ matrix.target }}/release/bundle/macos/*.app
+          path: ${{ runner.temp }}/diagnostics/*.app
           if-no-files-found: error
       - name: Remove temporary signing material
         if: always()
