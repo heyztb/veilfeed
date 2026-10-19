@@ -3,6 +3,15 @@
 Veilfeed publishes separate Apple Silicon and Intel DMGs. Tag workflows create
 draft releases only; publishing is always a manual maintainer action.
 
+## Signing modes
+
+The release workflow signs and notarizes with a Developer ID only when the
+`release` environment has an `APPLE_CERTIFICATE` secret. Without it, the DMGs
+are ad-hoc signed, the Gatekeeper and stapling checks are skipped, and users
+must approve the app under System Settings → Privacy & Security on first launch
+(the README's Install section explains this). When you add the Apple secrets
+below, remove that Gatekeeper paragraph from the README in the same change.
+
 ## One-time GitHub setup
 
 1. Push this repository to GitHub and protect `main`. Require the `ci / test`
