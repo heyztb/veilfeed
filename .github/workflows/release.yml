@@ -47,7 +47,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          RELEASE="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" 2>/dev/null || true)"
+          # The releases/tags endpoint never returns drafts and prints a JSON
+          # error body on 404, so search the release list instead.
+          find_release() {
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
+              --jq ".[] | select(.tag_name == \"$TAG\")" | jq -cs 'first // empty'
+          }
+          RELEASE="$(find_release)"
           if [[ -n "$RELEASE" ]]; then
             if [[ "$(jq -r .draft <<< "$RELEASE")" != "true" ]]; then
               echo "Refusing to modify an already-published release" >&2
@@ -55,9 +61,11 @@ jobs:
             fi
           else
             gh release create "$TAG" --verify-tag --draft --generate-notes --title "Veilfeed $TAG"
-            RELEASE="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+            RELEASE="$(find_release)"
           fi
-          echo "id=$(jq -r .id <<< "$RELEASE")" >> "$GITHUB_OUTPUT"
+          RELEASE_ID="$(jq -r .id <<< "$RELEASE")"
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          echo "id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
